@@ -1717,11 +1717,11 @@ def is_unwanted_remake(track_title: str, query: str = "", author: str = "") -> b
 
         "remake", "recreated", "re-created", "reproduction", "re-make", "arrangement",
 
-        "prod by", "prod.", "produced by", "beat by", "beats by", "status video", "whatsapp status"
+        "beat by", "beats by", "status video", "whatsapp status"
 
     ]
 
-    if not user_asked(["type beat", "beat", "remake", "fl studio", "prod"]):
+    if not user_asked(["type beat", "beat", "remake", "fl studio"]):
 
         for bad in beat_keywords:
 
@@ -1729,7 +1729,7 @@ def is_unwanted_remake(track_title: str, query: str = "", author: str = "") -> b
 
                 return True
 
-        for ba in ["type beat", "beats", "prod.", "remaker", "fl studio"]:
+        for ba in ["type beat", "fl studio", "remaker"]:
 
             if ba in a:
 
@@ -7968,7 +7968,6 @@ class MusicCog(commands.Cog, name="Music"):
 
                         return -100
 
-
                     norm_t = _norm_phonetic(t)
 
                     norm_a = _norm_phonetic(a)
@@ -7983,73 +7982,62 @@ class MusicCog(commands.Cog, name="Music"):
 
                         play_count = 0
 
-
                     score = 0
 
                     q_words = [w for w in clean_q.lower().split() if len(w) > 1]
 
                     norm_q_words = [w for w in norm_clean_q.split() if len(w) > 1]
 
-
                     title_matches = [w for w in q_words if w in t] or [w for w in norm_q_words if w in norm_t]
 
                     artist_matches = [w for w in q_words if w in a] or [w for w in norm_q_words if w in norm_a]
 
+                    # MANDATORY RELEVANCE FILTER:
+                    # At least the song title or artist MUST have a solid keyword or phonetic match with the search query!
+                    has_exact = (norm_clean_q == norm_t) or (norm_clean_q in norm_t) or (norm_t in norm_clean_q)
+                    if not has_exact and not title_matches and not (artist_matches and len(artist_matches) >= len(q_words)):
+                        return -100
+
+                    # If multi-word query, ensure at least half of the words match title or artist
+                    if len(q_words) >= 2 and (len(title_matches) + len(artist_matches)) < max(1, len(q_words) // 2):
+                        return -100
 
                     # Exact / phonetic match bonus
-
                     if norm_clean_q == norm_t:
 
-                        score += 35
+                        score += 45
 
                     elif norm_clean_q in norm_t or norm_t in norm_clean_q:
 
-                        score += 25
+                        score += 30
 
                     elif title_matches:
 
-                        score += len(title_matches) * 5
-
+                        score += len(title_matches) * 10
 
                     if artist_matches:
 
-                        score += len(artist_matches) * 6
+                        score += len(artist_matches) * 8
 
+                    # Language Priority
+                    if lang in ['hindi', 'bollywood', 'punjabi', 'english']:
 
-                    # Multi-word penalty if completely irrelevant
-
-                    if len(q_words) >= 2 and not artist_matches and len(title_matches) < len(q_words):
-
-                        score -= 20
-
-
-                    # Language Priority (Prioritize Hindi/Bollywood hits over obscure regional)
-
-                    if lang in ['hindi', 'bollywood']:
-
-                        score += 20
-
-                    elif lang in ['punjabi', 'english']:
-
-                        score += 12
+                        score += 5
 
                     elif lang in ['bhojpuri']:
 
-                        score -= 25  # Demote obscure tracks unless explicitly requested
-
+                        score -= 20  # Demote obscure tracks unless explicitly requested
 
                     # Popularity boost based on stream count
-
                     if play_count > 0:
 
                         try:
 
-                            score += min(20, math.log10(play_count) * 2.5)
+                            score += min(10, math.log10(play_count) * 1.5)
 
                         except Exception:
 
                             pass
-
 
                     return score
 
@@ -8058,7 +8046,7 @@ class MusicCog(commands.Cog, name="Music"):
 
                 scored.sort(key=lambda x: x[0], reverse=True)
 
-                if scored and scored[0][0] > 0:
+                if scored and scored[0][0] >= 15:
 
                     chosen = scored[0][1]
 
@@ -8211,35 +8199,20 @@ class MusicCog(commands.Cog, name="Music"):
 
         search_target = query.strip()
 
+        # Clean search prefix artifacts if passed from internal/external search wrappers
+        search_target = re.sub(r'(?i)^ytsearch\d*:\s*', '', search_target).strip()
+        search_target = re.sub(r'(?i)^scsearch\d*:\s*', '', search_target).strip()
+
         search_target = re.sub(r'(?i)\s+to\s+the\s+queue\.?$', '', search_target).strip()
 
         search_target = re.sub(r'(?i)^added\s+', '', search_target).strip()
 
         is_url = search_target.startswith("http://") or search_target.startswith("https://")
 
-        # Smart Viral / Trending Search Overrides (Matches latest trending hit: "barsaat" -> Banjaare)
-        if not is_url:
-            norm_q = search_target.lower().strip()
-            if norm_q in ['barsaat', 'barsat', 'barshat', 'barsaat song', 'barsat song', 'barsat new song', 'barsaat new song', 'barsaat song trending']:
-                search_target = "barsaat banjaare"
-
-        is_yt_title = any(k in search_target.lower() for k in ['|', 'visualizer', 'official', 'teaser', 'remix', 'prod.', 'prod by', 'feat.', 'ft.'])
-
-
-        # Smart AI Lyrics Identification (Only when query is genuinely lyrics without title markers)
-        if not is_url and not is_yt_title and len(search_target.split()) >= 4:
-            try:
-                resolved_song = await self.resolve_lyrics_to_song(search_target)
-                if resolved_song and resolved_song.lower() != search_target.lower():
-                    print(f"[SEARCH TRACK] Lyrics resolved: '{search_target}' -> '{resolved_song}'", flush=True)
-                    search_target = resolved_song
-            except Exception as e:
-                pass
-
         # ---------------- NATIVE RESOLVER & DIRECT SEARCH ----------------
         loop = asyncio.get_event_loop()
 
-        # Tier 1: JioSaavn Studio 320kbps CD Lossless Master Direct Search (Official releases, zero video skits/dialogues)
+        # Tier 1: JioSaavn Studio 320kbps CD Lossless Master Direct Search (High precision verified match only)
         if not is_url:
             try:
                 saavn_tr = await self.resolve_saavn_track(search_target, requester)
@@ -8521,11 +8494,10 @@ class MusicCog(commands.Cog, name="Music"):
             for use_ck in [False, True]:
                 try:
                     search_opts = get_ytdl_opts({
-                        'format': 'bestaudio/best',
                         'quiet': True,
-                        'extract_flat': False,
+                        'extract_flat': True,
                         'noplaylist': True,
-                        'socket_timeout': 15,
+                        'socket_timeout': 10,
                     }, use_cookies=use_ck)
                     with yt_dlp.YoutubeDL(search_opts) as ydl:
                         info = ydl.extract_info(f"ytsearch5:{yt_query}", download=False)
@@ -8743,10 +8715,10 @@ class MusicCog(commands.Cog, name="Music"):
                 pass
 
         fallback_queries.extend([
-            f"ytsearch8:Mix - {clean_title}",
-            f"ytsearch8:{target_artist} songs" if target_artist else None,
-            f"ytsearch8:{clean_title} similar songs",
-            f"ytsearch8:{clean_title} {target_artist}"
+            f"{target_artist} top song" if target_artist else None,
+            f"{clean_title} similar song",
+            f"{target_artist} hit song" if target_artist else None,
+            f"{clean_title} {target_artist}" if target_artist else None
         ])
         fallback_queries = [q for q in fallback_queries if q]
 
@@ -9435,12 +9407,16 @@ class MusicCog(commands.Cog, name="Music"):
             return await loading_msg.edit(embed=embed)
 
 
+        searching_embed = discord.Embed(
+            description=f"{E_RECORDSPIN} **Searching:** `{query[:80]}`...",
+            color=ANKUSH_COLOR
+        )
+        status_msg = await ctx.send(embed=searching_embed)
+
         track = await self.search_track(query, ctx.author)
 
         if not track:
-
-            return await ctx.send(embed=discord.Embed(description=f"{E_ALERT} No playable results found for `{query}`.", color=ANKUSH_COLOR))
-
+            return await status_msg.edit(embed=discord.Embed(description=f"{E_ALERT} No playable results found for `{query}`.", color=ANKUSH_COLOR))
 
         is_actually_playing = False
 
@@ -9453,7 +9429,6 @@ class MusicCog(commands.Cog, name="Music"):
             elif hasattr(player.voice_client, "is_paused") and player.voice_client.is_paused():
 
                 is_actually_playing = True
-
 
         if is_actually_playing:
 
@@ -9489,9 +9464,14 @@ class MusicCog(commands.Cog, name="Music"):
 
                 embed.set_thumbnail(url=track.thumbnail)
 
-            await ctx.send(embed=embed)
+            await status_msg.edit(embed=embed)
 
         else:
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
             await player.play_track(track)
 

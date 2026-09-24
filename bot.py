@@ -6094,13 +6094,12 @@ _gemini_key_index = 0
 _gemini_key_cooldowns = {}
 _configured_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
 AVAILABLE_GEMINI_MODELS = [
-    _configured_model,
     "gemini-3.5-flash-lite",
     "gemini-flash-lite-latest",
-    "gemini-3.6-flash",
+    _configured_model,
     "gemini-3.1-flash-lite",
     "gemini-3.1-flash-lite-preview",
-    "gemini-flash-latest"
+    "gemini-3.6-flash"
 ]
 # Deduplicate preserving order
 AVAILABLE_GEMINI_MODELS = list(dict.fromkeys([m for m in AVAILABLE_GEMINI_MODELS if m]))
