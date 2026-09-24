@@ -1,5 +1,5 @@
 import asyncio
-
+import requests
 import os
 
 import sys
@@ -36,7 +36,121 @@ except ImportError:
 
     psutil = None
 
-from typing import Optional, List, Dict, Any, Tuple
+try:
+    import audioop
+except ImportError:
+    audioop = None
+
+from typing import Optional, List, Dict, Any, Tuple, Set
+
+try:
+    from lastfm_client import lastfm_client
+except ImportError:
+    class LastFMClient:
+        def __init__(self, api_key: Optional[str] = None):
+            self.api_key = api_key or os.getenv("LASTFM_API_KEY") or "892ec4bdf3b1ea3aa74353988aaa4ee1"
+            self.base_url = "http://ws.audioscrobbler.com/2.0/"
+
+        async def _get(self, params: Dict[str, Any], timeout_sec: float = 6.0) -> Optional[Dict[str, Any]]:
+            if not self.api_key:
+                return None
+            params["api_key"] = self.api_key
+            params["format"] = "json"
+            try:
+                timeout = aiohttp.ClientTimeout(total=timeout_sec)
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(self.base_url, params=params, headers={"User-Agent": "Nayumi-MusicBot/2.0"}, timeout=timeout) as resp:
+                        if resp.status == 200:
+                            return await resp.json()
+            except Exception:
+                pass
+            return None
+
+        async def search_artist(self, artist: str) -> Optional[Dict[str, Any]]:
+            if not artist or not self.api_key:
+                return None
+            data = await self._get({"method": "artist.search", "artist": artist, "limit": 1})
+            if not data:
+                return None
+            try:
+                matches = data.get("results", {}).get("artistmatches", {}).get("artist")
+                if isinstance(matches, list) and matches:
+                    return matches[0]
+                elif isinstance(matches, dict):
+                    return matches
+            except Exception:
+                pass
+            return None
+
+        async def get_similar_tracks(self, artist: str, track: str, limit: int = 10) -> List[Dict[str, str]]:
+            if not self.api_key or not track:
+                return []
+            params = {"method": "track.getsimilar", "track": track, "limit": limit}
+            if artist:
+                params["artist"] = artist
+            data = await self._get(params)
+            if not data:
+                return []
+            results = []
+            try:
+                tracks = data.get("similartracks", {}).get("track", [])
+                if isinstance(tracks, dict):
+                    tracks = [tracks]
+                for t in tracks:
+                    name = t.get("name")
+                    art_name = t.get("artist", {}).get("name") if isinstance(t.get("artist"), dict) else str(t.get("artist") or "")
+                    if name and art_name:
+                        results.append({"title": name, "author": art_name})
+            except Exception:
+                pass
+            return results
+
+        async def get_similar_artists(self, artist: str, limit: int = 5) -> List[str]:
+            if not self.api_key or not artist:
+                return []
+            search_res = await self.search_artist(artist)
+            target_artist = search_res.get("name") if (search_res and search_res.get("name")) else artist
+            data = await self._get({"method": "artist.getsimilar", "artist": target_artist, "limit": limit, "autocorrect": 1})
+            if not data:
+                return []
+            results = []
+            try:
+                artists = data.get("similarartists", {}).get("artist", [])
+                if isinstance(artists, dict):
+                    artists = [artists]
+                for a in artists:
+                    name = a.get("name")
+                    if name:
+                        results.append(name)
+            except Exception:
+                pass
+            return results
+
+        async def get_top_tracks(self, artist: str, limit: int = 5) -> List[Dict[str, str]]:
+            if not self.api_key or not artist:
+                return []
+            data = await self._get({"method": "artist.gettoptracks", "artist": artist, "limit": limit, "autocorrect": 1})
+            if not data:
+                return []
+            results = []
+            try:
+                tracks = data.get("toptracks", {}).get("track", [])
+                if isinstance(tracks, dict):
+                    tracks = [tracks]
+                for t in tracks:
+                    name = t.get("name")
+                    art_name = t.get("artist", {}).get("name") if isinstance(t.get("artist"), dict) else str(t.get("artist") or artist)
+                    if name:
+                        results.append({"title": name, "author": art_name or artist})
+            except Exception:
+                pass
+            return results
+
+        async def get_top_tracks_by_tag(self, tag: str, limit: int = 10) -> List[Dict[str, str]]:
+            return []
+
+    lastfm_client = LastFMClient()
+
 
 
 BOT_BOOT_TIME = time.time()
@@ -178,11 +292,6 @@ try:
 except ImportError:
     np = None
 
-try:
-    import discord.ext.voice_recv as voice_recv
-except ImportError:
-    voice_recv = None
-
 import discord.voice_client
 # Voice encryption modes: Prioritize aead_xchacha20_poly1305_rtpsize for modern Discord encryption
 discord.voice_client.VoiceClient.supported_modes = (
@@ -191,93 +300,9 @@ discord.voice_client.VoiceClient.supported_modes = (
     'xsalsa20_poly1305_suffix',
     'xsalsa20_poly1305',
 )
-if voice_recv:
-    voice_recv.VoiceRecvClient.supported_modes = (
-        'aead_xchacha20_poly1305_rtpsize',
-        'xsalsa20_poly1305_lite',
-        'xsalsa20_poly1305_suffix',
-        'xsalsa20_poly1305',
-    )
-
-    # ---------------- CRITICAL BUGFIX: discord.ext.voice_recv CRASH PREVENTION ----------------
-    # In upstream discord.ext.voice_recv, _remove_ssrc accesses self._reader.speaking_timer without
-    # checking if _reader is active/initialized. When users leave/mute/unmute, this crashes the
-    # voice websocket with AttributeError: '_MissingSentinel' object has no attribute 'speaking_timer'.
-    def _safe_remove_ssrc(self, *, user_id: int) -> None:
-        ssrc = self._id_to_ssrc.pop(user_id, None)
-        if ssrc:
-            reader = getattr(self, '_reader', None)
-            if reader and reader is not discord.utils.MISSING and hasattr(reader, 'speaking_timer') and reader.speaking_timer:
-                try:
-                    reader.speaking_timer.drop_ssrc(ssrc)
-                except Exception:
-                    pass
-            self._ssrc_to_id.pop(ssrc, None)
-
-    voice_recv.VoiceRecvClient._remove_ssrc = _safe_remove_ssrc
-
-    def _safe_add_ssrc(self, user_id: int, ssrc: int) -> None:
-        self._ssrc_to_id[ssrc] = user_id
-        self._id_to_ssrc[user_id] = ssrc
-        reader = getattr(self, '_reader', None)
-        if reader and reader is not discord.utils.MISSING and hasattr(reader, 'packet_router') and reader.packet_router:
-            try:
-                reader.packet_router.set_user_id(ssrc, user_id)
-            except Exception:
-                pass
-
-    voice_recv.VoiceRecvClient._add_ssrc = _safe_add_ssrc
-
-    def _safe_dispatch_sink(self, event: str, /, *args, **kwargs) -> None:
-        reader = getattr(self, '_reader', None)
-        if reader and reader is not discord.utils.MISSING and hasattr(reader, 'event_router') and reader.event_router:
-            try:
-                reader.event_router.dispatch(event, *args, **kwargs)
-            except Exception:
-                pass
-
-    voice_recv.VoiceRecvClient.dispatch_sink = _safe_dispatch_sink
-
-    def _safe_get_speaking(self, member) -> Optional[bool]:
-        ssrc = self._get_ssrc_from_id(member.id)
-        if ssrc is None:
-            return None
-        reader = getattr(self, '_reader', None)
-        if reader and reader is not discord.utils.MISSING and hasattr(reader, 'speaking_timer') and reader.speaking_timer:
-            try:
-                return reader.speaking_timer.get_speaking(ssrc)
-            except Exception:
-                pass
-        return None
-
-    voice_recv.VoiceRecvClient.get_speaking = _safe_get_speaking
-
-    _orig_on_vsu = getattr(voice_recv.VoiceRecvClient, 'on_voice_state_update', None)
-    if _orig_on_vsu:
-        async def _safe_on_voice_state_update(self, data):
-            try:
-                await _orig_on_vsu(self, data)
-            except Exception:
-                pass
-        voice_recv.VoiceRecvClient.on_voice_state_update = _safe_on_voice_state_update
-
-    # Safe hook wrapper in voice_recv.gateway to prevent ANY unhandled exception from killing voice ws
-    try:
-        import discord.ext.voice_recv.gateway as vr_gw
-        _orig_hook = vr_gw.hook
-        async def _safe_hook(self_ws, msg):
-            try:
-                await _orig_hook(self_ws, msg)
-            except Exception as hook_err:
-                logging.getLogger("discord.ext.voice_recv.gateway").debug(f"Ignored voice recv hook exception: {hook_err}")
-        vr_gw.hook = _safe_hook
-    except Exception:
-        pass
 
 logging.getLogger("discord.voice_state").setLevel(logging.ERROR)
 logging.getLogger("discord.player").setLevel(logging.ERROR)
-logging.getLogger("discord.ext.voice_recv").setLevel(logging.WARNING)
-logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.WARNING)
 
 from pydub import AudioSegment
 
@@ -295,6 +320,7 @@ import wavelink
 import imageio_ffmpeg
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
 
 
 # -------------------- WHITE VISUAL LOGO CUSTOM EMOJIS --------------------
@@ -1812,161 +1838,368 @@ def is_unwanted_remake(track_title: str, query: str = "", author: str = "") -> b
 
 
 KNOWN_ARTIST_TOKENS = {
-
     'yo', 'honey', 'singh', 'karan', 'aujla', 'sidhu', 'moose', 'wala', 'arijit', 'diljit', 
-
     'dosanjh', 'badshah', 'shubh', 'ap', 'dhillon', 'king', 'divine', 'emiway', 'raftaar', 
-
     'kr$na', 'mc', 'stan', 'aur', 'talwiinder', 'harnoor', 'prabh', 'subh', 'guru', 'randhawa',
-
-    'neha', 'kakkar', 'jubin', 'nautiyal', 'darshan', 'raval', 'anuv', 'jain', 'arjan', 'dhillon'
-
+    'neha', 'kakkar', 'jubin', 'nautiyal', 'darshan', 'raval', 'anuv', 'jain', 'arjan', 'dhillon',
+    'diler', 'kharkiya', 'gulzaar', 'chhaniwala', 'masoom', 'sharma', 'renuka', 'panwar',
+    'khasa', 'aala', 'chahar', 'amit', 'saini', 'rohtakiya', 'sumit', 'goswami', 'raju', 'punjabi',
+    'sapna', 'choudhary', 'vicky', 'kajla', 'surender', 'romio', 'ruchika', 'jangid', 'bintu', 'pabra',
+    'pawan', 'khesari', 'lal', 'yadav', 'shilpi', 'raj', 'arvind', 'akela', 'kallu', 'neelkamal',
+    'pramod', 'premi', 'ritesh', 'pandey', 'anirudh', 'rahman', 'sriram'
 }
 
 
 def extract_smart_artist(title: str, uploader: str) -> str:
-
     clean_up = re.sub(r'(?i)\s*-\s*topic$', '', uploader or "").strip()
-
     clean_up = re.sub(r'(?i)vevo$', '', clean_up).strip()
 
-
     is_label = any(lbl in (uploader or "").lower() for lbl in [
-
         't-series', 'tseries', 'sony music', 'zee music', 'yrf', 'speed records', 
-
         'tips', 'saregama', 'geet mp3', 'white hill', 'desi music', 'rehaan records',
-
         'warnermusic', 'universal music', 'records', 'music company', 'single track',
-
-        'apna punjab', 'bhangra', 'lofi music', 'official'
-
+        'apna punjab', 'bhangra', 'lofi music', 'official', 'nav haryanvi', 'desi records',
+        'sonar', 'wave music', 'dhaakad', 'banger music', 'prime records', 'vats records',
+        'gem tunes', 'hitz', 'music', 'channel', 'entertainment'
     ]) or (uploader or "").lower() in ['unknown artist', 'artist', 'various artists', '']
 
-
     if not is_label and clean_up and len(clean_up) > 2:
-
         return clean_up
 
-
+    # Check for known artists in any section of title
     for part in re.split(r'[|\-:]', title or ""):
-
         p = part.strip()
-
         p_clean = re.sub(r'(?i)[\[\(].*?[\]\)]', '', p).strip()
-
         if any(token in p_clean.lower() for token in [
-
             'karan aujla', 'sidhu moose', 'arijit', 'diljit', 'badshah', 'shubh', 
-
             'ap dhillon', 'king', 'divine', 'emiway', 'raftaar', 'kr$na', 'mc stan', 
-
             'talwiinder', 'harnoor', 'prabh', 'guru randhawa', 'anuv jain', 'yo yo honey singh',
-
             'honey singh', 'neha kakkar', 'jubin nautiyal', 'darshan raval', 'arjan dhillon',
-
             'atif aslam', 'kk', 'sonu nigam', 'shreya ghoshal', 'mohit chauhan', 'armaan malik',
-
             'jasleen royal', 'prateek kuhad', 'bayaan', 'aur', 'kaavish', 'mitraz', 'the local train',
-
+            'diler kharkiya', 'gulzaar chhaniwala', 'masoom sharma', 'renuka panwar', 'khasa aala chahar',
+            'sumit goswami', 'amit saini rohtakiya', 'raju punjabi', 'surender romio', 'ruchika jangid',
+            'sapna choudhary', 'vicky kajla', 'bintu pabra', 'pawan singh', 'khesari', 'shilpi raj',
             'weeknd', 'drake', 'travis scott', 'eminem', 'taylor swift', 'ed sheeran', 
-
             'post malone', 'billie eilish', 'justin bieber', 'dua lipa', 'bruno mars',
-
             'ariana grande', 'olivia rodrigo', 'sabrina carpenter', 'kendrick', 'charlie puth',
-
             'coldplay', 'imagine dragons', 'chase atlantic', 'joji', 'lana del rey'
-
         ]):
-
             return p_clean
 
-
-    parts = [p.strip() for p in re.split(r'[|\-]', title or "") if p.strip()]
-
+    # Fallback to parts (Artist - Song Title or Song Title | Artist)
+    parts = [p.strip() for p in re.split(r'[|\-–—]', title or "") if p.strip()]
     if len(parts) >= 2:
-
-        p_clean = re.sub(r'(?i)[\[\(].*?[\]\)]', '', parts[1]).strip()
-
-        if p_clean and len(p_clean) < 35:
-
-            return p_clean
+        p0 = re.sub(r'(?i)[\[\(].*?[\]\)]', '', parts[0]).strip()
+        p1 = re.sub(r'(?i)[\[\(].*?[\]\)]', '', parts[1]).strip()
+        if p0 and len(p0) < 35 and not any(w in p0.lower() for w in ['official', 'video', 'song', 'audio', 'full', 'new', 'latest']):
+            return p0
+        if p1 and len(p1) < 35 and not any(w in p1.lower() for w in ['official', 'video', 'song', 'audio', 'full', 'new', 'latest']):
+            return p1
 
     return clean_up or "Trending Hits"
 
 
 VIBE_CLUSTERS = [
-
     {
-
-        "keywords": ["karan aujla", "shubh", "ap dhillon", "sidhu moose", "diljit", "talwiinder", "arjan dhillon", "harnoor", "jerry", "prabh", "wazir patar", "ikky", "amrit maan", "sukha", "cheema y", "jordan sandhu", "bhangra", "punjabi"],
-
-        "related": ["Shubh", "AP Dhillon", "Karan Aujla", "Diljit Dosanjh", "Sidhu Moose Wala", "Talwiinder", "Arjan Dhillon", "Harnoor", "Sukha", "Jerry", "Jordan Sandhu"],
-
+        "keywords": [
+            "sad", "barsaat", "barish", "dard", "judai", "bewafa", "dhokha", "rone", "gam",
+            "alone", "broken", "heartbreak", "emotional", "pain", "tears", "duriya", "yaad",
+            "judayi", "tanhai", "chhod", "bairan", "rove", "aansu", "dil tod", "tuta dil",
+            "banjaare", "banjare", "faheem abdullah", "o bedardeya", "apna bana le", "channa mereya"
+        ],
+        "related": [
+            "Banjaare", "Arijit Singh", "Darshan Raval", "B Praak", "Atif Aslam",
+            "Vishal Mishra", "Jubin Nautiyal", "Jasleen Royal", "Anuv Jain", "Faheem Abdullah"
+        ],
+        "search_tag": "trending hindi sad songs 2025 2026 heart touching"
+    },
+    {
+        "keywords": [
+            "haryanvi", "diler kharkiya", "masoom sharma", "renuka panwar", "gulzaar chhaniwala",
+            "amit saini rohtakiya", "khasa aala chahar", "kd desi rockstar", "md", "raju punjabi",
+            "sapna choudhary", "vicky kajla", "sumit goswami", "bintu pabra", "shiva choudhary",
+            "dc madana", "tarun panwar", "pranjal dahiya", "naveen punia", "ruchika jangid",
+            "monika sharma", "surender romio", "manisha sharma", "uk haryanvi", "chhatri",
+            "gandharv", "haryana", "white hill dhaakad", "desi records", "nav haryanvi", "sonar",
+            "52 gaj ka daman", "gypsy", "bahu kale ki"
+        ],
+        "related": [
+            "Diler Kharkiya", "Gulzaar Chhaniwala", "Masoom Sharma", "Khasa Aala Chahar",
+            "Renuka Panwar", "Sumit Goswami", "Amit Saini Rohtakiya", "Vicky Kajla",
+            "Raju Punjabi", "Surender Romio", "Bintu Pabra", "Pranjal Dahiya"
+        ],
+        "search_tag": "latest haryanvi hit songs 2025 2026"
+    },
+    {
+        "keywords": [
+            "karan aujla", "shubh", "ap dhillon", "sidhu moose", "diljit", "talwiinder",
+            "arjan dhillon", "harnoor", "jerry", "prabh", "wazir patar", "ikky", "amrit maan",
+            "sukha", "cheema y", "jordan sandhu", "bhangra", "punjabi", "speed records",
+            "geet mp3", "rehaan records", "desi crew"
+        ],
+        "related": [
+            "Shubh", "AP Dhillon", "Karan Aujla", "Diljit Dosanjh", "Sidhu Moose Wala",
+            "Talwiinder", "Arjan Dhillon", "Harnoor", "Sukha", "Jerry", "Jordan Sandhu", "Wazir Patar"
+        ],
         "search_tag": "latest punjabi trending songs 2025"
-
     },
-
     {
-
-        "keywords": ["arijit", "pritam", "darshan raval", "jubin nautiyal", "jasleen royal", "atif aslam", "kk", "mohit chauhan", "armaan malik", "vishal mishra", "sachet tandon", "shreya ghoshal", "b praak", "javed ali", "sonu nigam", "mithoon", "sachin jigar", "vishal shekhar", "shaan", "sunidhi chauhan"],
-
-        "related": ["Arijit Singh", "Jasleen Royal", "Darshan Raval", "Vishal Mishra", "Jubin Nautiyal", "Pritam", "Atif Aslam", "Armaan Malik", "B Praak", "Javed Ali", "Sonu Nigam", "Shreya Ghoshal"],
-
+        "keywords": [
+            "arijit", "pritam", "darshan raval", "jubin nautiyal", "jasleen royal", "atif aslam",
+            "kk", "mohit chauhan", "armaan malik", "vishal mishra", "sachet tandon", "shreya ghoshal",
+            "b praak", "javed ali", "sonu nigam", "mithoon", "sachin jigar", "vishal shekhar",
+            "shaan", "sunidhi chauhan", "bollywood", "hindi song", "hindi"
+        ],
+        "related": [
+            "Arijit Singh", "Jasleen Royal", "Darshan Raval", "Vishal Mishra", "Jubin Nautiyal",
+            "Pritam", "Atif Aslam", "Armaan Malik", "B Praak", "Javed Ali", "Sonu Nigam", "Shreya Ghoshal"
+        ],
         "search_tag": "latest bollywood romantic trending songs 2025"
-
     },
-
     {
-
-        "keywords": ["kr$na", "seedhe maut", "divine", "emiway", "raftaar", "mc stan", "king", "karma", "talha anjum", "young stunners", "fukra insaan", "yung sammy", "rawal", "calm", "encore abj", "dhh", "hip hop", "rap"],
-
-        "related": ["Seedhe Maut", "KR$NA", "DIVINE", "Emiway Bantai", "Talha Anjum", "Raftaar", "King", "MC Stan", "Karma"],
-
+        "keywords": [
+            "kr$na", "krsna", "seedhe maut", "divine", "emiway", "raftaar", "mc stan", "king",
+            "karma", "talha anjum", "young stunners", "fukra insaan", "yung sammy", "rawal",
+            "calm", "encore abj", "dhh", "hip hop", "rap", "kalamkaar", "gully gang"
+        ],
+        "related": [
+            "Seedhe Maut", "KR$NA", "DIVINE", "Emiway Bantai", "Talha Anjum", "Raftaar",
+            "King", "MC Stan", "Karma", "Young Stunners"
+        ],
         "search_tag": "latest DHH desi hip hop trending songs"
-
     },
-
     {
-
-        "keywords": ["anuv jain", "aur", "mitraz", "kaavish", "bayaan", "prateek kuhad", "the local train", "achint", "aditya rikhari", "aditya a", "chaand baaliyan", "zaeden", "akash ahuja", "when chai met toast", "yellow diary", "sanah moidutty", "indie"],
-
-        "related": ["AUR", "Anuv Jain", "Mitraz", "Aditya Rikhari", "Prateek Kuhad", "The Local Train", "Bayaan", "Kaavish", "Zaeden", "Jasleen Royal"],
-
+        "keywords": [
+            "bhojpuri", "khesari", "pawan singh", "silpi raj", "shilpi raj", "arvind akela",
+            "kallu", "pramod premi", "gunjan singh", "neelkamal singh", "antra singh",
+            "samar singh", "ankush raja", "ritesh pandey", "bhojpuriya", "wave music", "nirahua"
+        ],
+        "related": [
+            "Pawan Singh", "Khesari Lal Yadav", "Shilpi Raj", "Arvind Akela Kallu",
+            "Neelkamal Singh", "Pramod Premi Yadav", "Ritesh Pandey"
+        ],
+        "search_tag": "latest bhojpuri trending hit songs 2025"
+    },
+    {
+        "keywords": [
+            "anuv jain", "aur", "mitraz", "kaavish", "bayaan", "prateek kuhad", "the local train",
+            "achint", "aditya rikhari", "aditya a", "chaand baaliyan", "zaeden", "akash ahuja",
+            "when chai met toast", "yellow diary", "sanah moidutty", "indie", "chill hindi"
+        ],
+        "related": [
+            "AUR", "Anuv Jain", "Mitraz", "Aditya Rikhari", "Prateek Kuhad", "The Local Train",
+            "Bayaan", "Kaavish", "Zaeden", "Jasleen Royal"
+        ],
         "search_tag": "latest hindi indie chill trending songs"
-
     },
-
     {
-
-        "keywords": ["weeknd", "travis scott", "drake", "post malone", "taylor swift", "billie eilish", "sabrina carpenter", "dua lipa", "bruno mars", "kendrick", "chase atlantic", "olivia rodrigo", "justin bieber", "ed sheeran", "coldplay", "imagine dragons", "charlie puth", "sia", "chainsmokers", "marshmello", "maroon 5", "pop"],
-
-        "related": ["The Weeknd", "Sabrina Carpenter", "Billie Eilish", "Dua Lipa", "Post Malone", "Bruno Mars", "Coldplay", "Imagine Dragons", "Taylor Swift", "Travis Scott", "Olivia Rodrigo"],
-
+        "keywords": [
+            "rajasthani", "marwadi", "prakash gandharv", "seema mishra", "twinkle vaishnav",
+            "rani rangili", "rajasthan", "chhotu singh rawna"
+        ],
+        "related": [
+            "Rani Rangili", "Twinkle Vaishnav", "Prakash Mali", "Chhotu Singh Rawna"
+        ],
+        "search_tag": "latest rajasthani superhit songs 2025"
+    },
+    {
+        "keywords": [
+            "telugu", "tamil", "anirudh", "ar rahman", "thaman", "sid sriram", "dsp",
+            "devi sri prasad", "harris jayaraj", "santhosh narayanan", "malayalam", "kannada",
+            "kollywood", "tollywood"
+        ],
+        "related": [
+            "Anirudh Ravichander", "A. R. Rahman", "Sid Sriram", "Thaman S", "Devi Sri Prasad", "G. V. Prakash Kumar"
+        ],
+        "search_tag": "latest south indian trending songs 2025"
+    },
+    {
+        "keywords": [
+            "weeknd", "travis scott", "drake", "post malone", "taylor swift", "billie eilish",
+            "sabrina carpenter", "dua lipa", "bruno mars", "kendrick", "chase atlantic",
+            "olivia rodrigo", "justin bieber", "ed sheeran", "coldplay", "imagine dragons",
+            "charlie puth", "sia", "chainsmokers", "marshmello", "maroon 5", "alan walker", "pop", "english song"
+        ],
+        "related": [
+            "The Weeknd", "Sabrina Carpenter", "Billie Eilish", "Dua Lipa", "Post Malone",
+            "Bruno Mars", "Coldplay", "Imagine Dragons", "Taylor Swift", "Travis Scott", "Olivia Rodrigo"
+        ],
         "search_tag": "latest global pop trending hits 2025"
-
     }
-
 ]
 
-
 def get_vibe_suggestions(title: str, artist: str) -> Tuple[List[str], str]:
-
     text = f"{title} {artist}".lower()
-
     for cluster in VIBE_CLUSTERS:
-
         if any(k in text for k in cluster["keywords"]):
-
             related = [a for a in cluster["related"] if a.lower() not in text]
-
             if not related:
-
                 related = cluster["related"]
-
             return related, cluster["search_tag"]
 
-    return ["Trending Hits", "Popular Hits"], "latest trending songs"
+    # Fallback to language detection if specific artist wasn't in cluster
+    if any(w in text for w in ["haryanvi", "haryana"]):
+        return [
+            "Diler Kharkiya", "Gulzaar Chhaniwala", "Masoom Sharma", "Khasa Aala Chahar",
+            "Renuka Panwar", "Sumit Goswami", "Amit Saini Rohtakiya", "Vicky Kajla", "Raju Punjabi"
+        ], "latest haryanvi hit songs 2025 2026"
+    if any(w in text for w in ["punjabi", "bhangra"]):
+        return [
+            "Shubh", "AP Dhillon", "Karan Aujla", "Diljit Dosanjh", "Sidhu Moose Wala", "Talwiinder"
+        ], "latest punjabi trending songs 2025"
+    if any(w in text for w in ["bhojpuri"]):
+        return [
+            "Pawan Singh", "Khesari Lal Yadav", "Shilpi Raj", "Arvind Akela Kallu", "Neelkamal Singh"
+        ], "latest bhojpuri trending hit songs 2025"
+    if any(w in text for w in ["hindi", "bollywood"]):
+        return [
+            "Arijit Singh", "Jasleen Royal", "Darshan Raval", "Vishal Mishra", "Jubin Nautiyal", "Pritam"
+        ], "latest bollywood romantic trending songs 2025"
+
+    return ["Trending Hits", "Popular Hits"], "latest trending songs 2025"
+
+GENERIC_MUSIC_WORDS = {
+    'song', 'songs', 'video', 'audio', 'official', 'lyrics', 'lyrical', 'full', 'hd', '4k',
+    'remix', 'mix', 'feat', 'ft', 'prod', 'by', 'new', 'latest', 'hit', 'hits', 'trending',
+    'punjabi', 'haryanvi', 'hindi', 'bhojpuri', 'rajasthani', 'bhangra', 'track', 'music',
+    'records', 'company', 'series', 'tseries', 'zee', 'sony', 'speed', 'live', 'status',
+    'shorts', 'reels', 'slowed', 'reverb', 'bass', 'boosted', 'dholki', 'dj', 'nonstop',
+    'teaser', 'trailer', 'promo', 'bgm', 'theme', 'original', 'soundtrack', 'ost',
+    '2020', '2021', '2022', '2023', '2024', '2025', '2026'
+}
+
+def extract_core_name(title: str) -> str:
+    """Extracts core song title by removing bracketed info, generic tags, and noise tokens (ported from Groove-Music)."""
+    if not title:
+        return ""
+    core = title.lower()
+    core = re.sub(r'\(.*?\)', '', core)
+    core = re.sub(r'\[.*?\]', '', core)
+    core = re.sub(r'\{.*?\}', '', core)
+    core = re.sub(r'(?i)\b(official|video|audio|lyric|lyrics|music|song|full|hd|4k|8k|version|remix|edit|remaster|visualizer|feat|ft|prod)\b', '', core)
+    core = re.sub(r'[^a-z0-9\s]', '', core)
+    return re.sub(r'\s+', ' ', core).strip()
+
+
+def clean_title_for_comparison(title: str, artist: str = '') -> str:
+    """Cleans title for deduplication by stripping brackets, audio/video suffixes, and artist prefixes."""
+    if not title:
+        return ""
+    core = title.lower()
+    core = re.sub(r'[\(\[\{][^\)\]\}]*[\)\]\}]', '', core)
+    core = re.sub(r'(?i)\b(official|video|audio|lyric|lyrics|music|song|full|hd|4k|8k|version|remix|edit|remaster|visualizer|feat|ft|prod)\b', '', core)
+    if ' - ' in core:
+        parts = core.split(' - ', 1)
+        core = parts[1]
+    elif ':' in core:
+        parts = core.split(':', 1)
+        core = parts[1]
+    if artist:
+        for art_word in re.split(r'\W+', artist.lower()):
+            if len(art_word) > 2:
+                core = re.sub(r'\b' + re.escape(art_word) + r'\b', '', core)
+    core = re.sub(r'[^a-z0-9\s]', '', core)
+    return re.sub(r'\s+', ' ', core).strip()
+
+
+def is_similar_title(title1: str, title2: str, artist1: str = '', artist2: str = '') -> bool:
+    """Determines if two song titles are virtually identical, ignoring common artist prefixes and noise."""
+    if not title1 or not title2:
+        return False
+    c1 = clean_title_for_comparison(title1, artist1)
+    c2 = clean_title_for_comparison(title2, artist2)
+    if not c1 or not c2:
+        return False
+    if c1 == c2:
+        return True
+    words1 = [w for w in c1.split() if len(w) > 2]
+    words2 = [w for w in c2.split() if len(w) > 2]
+    if not words1 or not words2:
+        return c1 == c2
+    common_words = [w for w in words1 if w in words2]
+    similarity = len(common_words) / max(len(words1), len(words2))
+    return similarity > 0.65
+
+
+def clean_track_author(author: str) -> str:
+    """Cleans artist/author name by stripping - Topic, VEVO, and channel suffixes (ported from Groove-Music)."""
+    if not author:
+        return ""
+    cleaned = re.sub(r'(?i)\s*-\s*Topic\s*$', '', author).strip()
+    cleaned = re.sub(r'(?i)\b(vevo|official|channel|records|music)\b', '', cleaned).strip()
+    return cleaned or author
+
+
+def extract_core_song_keywords(title: str, artist: str = '') -> Set[str]:
+    core = extract_core_name(title)
+    words = [w for w in core.split() if len(w) >= 3 and w not in GENERIC_MUSIC_WORDS]
+    if artist:
+        art_words = set(re.split(r'\W+', artist.lower()))
+        words = [w for w in words if w not in art_words]
+    return set(words)
+
+
+def is_same_or_played_song(
+    current_title: str,
+    current_artist: str,
+    candidate_title: str,
+    candidate_author: str,
+    excluded_titles: Set[str]
+) -> bool:
+    if is_similar_title(current_title, candidate_title):
+        return True
+    for played in excluded_titles:
+        if is_similar_title(played, candidate_title):
+            return True
+    return False
+
+def score_autoplay_candidate(
+    entry: dict,
+    current_title: str,
+    artist: str,
+    related_artists: List[str],
+    search_tag: str
+) -> float:
+    t = (entry.get('title') or '').lower()
+    auth = (entry.get('uploader') or entry.get('channel') or '').lower()
+    dur = int(entry.get('duration') or 0)
+
+    if dur > 0 and (dur < 75 or dur > 500):
+        return -1000.0
+
+    if any(w in t for w in ["1 hour", "10 hours", "nonstop", "full album", "podcast", "jukebox", "compilation", "all songs", "mashup", "reaction", "status", "shorts", "reels", "#shorts"]):
+        return -1000.0
+
+    score = 100.0
+
+    # Boost for same artist's OTHER songs
+    if artist and artist not in ["Trending Hits", "Popular Hits", "Artist", "Unknown"]:
+        art_low = artist.lower()
+        if art_low in t or art_low in auth:
+            score += 45.0
+
+    # Boost for related top artists in the same vibe
+    if related_artists:
+        if any(ra.lower() in t or ra.lower() in auth for ra in related_artists):
+            score += 55.0
+
+    # Heavy boost for latest / new releases (2025/2026)
+    if any(yr in t for yr in ["2026", "2025", "2024", "new", "latest", "trending", "hit"]):
+        score += 30.0
+
+    # Official release bonus
+    if any(ok in t for ok in ["official video", "music video", "official audio", "official"]):
+        score += 20.0
+
+    # Penalize low quality or unwanted versions
+    if any(bad in t for bad in ["slowed", "reverb", "sped up", "nightcore", "bass boosted", "cover", "unplugged", "karaoke", "ringtone"]):
+        score -= 40.0
+
+    # Random jitter for natural variety
+    score += random.uniform(0, 15)
+
+    return score
 
 
 def score_track_candidate(entry: dict, query: str = "", index: int = 0) -> float:
@@ -2677,6 +2910,70 @@ class BufferedAudioSource(discord.AudioSource):
             threading.Thread(target=_async_cleanup, daemon=True).start()
 
 
+class NayumiBufferedAudioSource(discord.AudioSource):
+    """
+    Studio-Grade Asynchronous Ring-Buffered Audio Source.
+    Completely eliminates Discord fast-forwarding, time-stretch pitch shifting,
+    and intermittent speed bursts caused by network jitter or FFmpeg pipe stalls.
+    """
+    def __init__(self, original: discord.AudioSource, prebuffer_frames: int = 50, max_buffer_frames: int = 500):
+        self.original = original
+        self.max_buffer_frames = max_buffer_frames
+        self.prebuffer_frames = prebuffer_frames
+        self._buffer: queue.Queue[bytes] = queue.Queue(maxsize=max_buffer_frames)
+        self._stop_event = threading.Event()
+        self._eof_event = threading.Event()
+        self._reader_thread = threading.Thread(target=self._worker, daemon=True, name="NayumiAudioBufferWorker")
+        self._reader_thread.start()
+
+        # Pre-buffer ~1.0s (50 frames of 20ms) so Discord AudioPlayer never underruns
+        prebuffer_deadline = time.time() + 2.5
+        while not self._eof_event.is_set() and self._buffer.qsize() < prebuffer_frames and time.time() < prebuffer_deadline:
+            time.sleep(0.015)
+
+    def _worker(self):
+        while not self._stop_event.is_set():
+            try:
+                frame = self.original.read()
+                if not frame:
+                    self._eof_event.set()
+                    break
+                while not self._stop_event.is_set():
+                    try:
+                        self._buffer.put(frame, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+            except Exception:
+                self._eof_event.set()
+                break
+
+    def is_opus(self) -> bool:
+        return self.original.is_opus() if hasattr(self.original, "is_opus") else False
+
+    def read(self) -> bytes:
+        if self._stop_event.is_set():
+            return b""
+        try:
+            return self._buffer.get_nowait()
+        except queue.Empty:
+            if self._eof_event.is_set():
+                return b""
+            # If buffer is momentarily empty due to severe network jitter,
+            # send a 20ms silence frame instead of blocking.
+            # This prevents Discord's AudioPlayer thread from falling behind
+            # and bursting packets later (which causes fast-forward speedup)!
+            return b"\x00" * 3840
+
+    def cleanup(self):
+        self._stop_event.set()
+        if hasattr(self.original, "cleanup"):
+            try:
+                self.original.cleanup()
+            except Exception:
+                pass
+
+
 class NayumiVolumeTransformer(discord.AudioSource):
     """
     Studio-Grade Perceptual Audio Volume Transformer for Discord Voice.
@@ -2728,15 +3025,20 @@ class NayumiVolumeTransformer(discord.AudioSource):
             self._current_factor = self._target_factor
             factor = self._target_factor
 
+        # Pure bit-perfect passthrough at standard 100% volume
         if abs(factor - 1.0) < 0.001:
             return data
 
-        import audioop
-        return audioop.mul(data, 2, min(factor, 3.0))
+        if audioop is not None:
+            return audioop.mul(data, 2, min(factor, 3.0))
+        return data
 
     def cleanup(self):
         if hasattr(self.original, "cleanup"):
-            self.original.cleanup()
+            try:
+                self.original.cleanup()
+            except Exception:
+                pass
 
 
 class Track:
@@ -2762,6 +3064,15 @@ class Track:
         self.direct_url_time: float = 0.0
 
         self.wavelink_track: Optional[wavelink.Playable] = None
+
+
+    @property
+    def duration_sec(self) -> int:
+        return int((self.length or 0) // 1000)
+
+    @duration_sec.setter
+    def duration_sec(self, val: int):
+        self.length = int(val or 0) * 1000
 
 
     @property
@@ -2836,6 +3147,7 @@ class GuildPlayer:
         self.loop_mode: str = "off" # "off", "track", "queue"
 
         self.autoplay: bool = False
+        self.skip_requested: bool = False
 
         self.active_filters: Dict[str, str] = {}
 
@@ -2865,6 +3177,8 @@ class GuildPlayer:
 
         self.played_uris: set = set()
         self.played_titles: set = set()
+        self.session_mood: Optional[str] = None
+        self.session_genre: Optional[str] = None
         self.voice_sink: Optional[Any] = None
 
 
@@ -3254,7 +3568,8 @@ class GuildPlayer:
             track.direct_url_time = time.time()
 
 
-        before_opts = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
+        ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        before_opts = f'-headers "User-Agent: {ua}\r\n" -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin'
         if seek_ms > 0:
             before_opts = f"-ss {seek_ms / 1000.0} " + before_opts
 
@@ -3262,7 +3577,8 @@ class GuildPlayer:
 
         try:
             raw_source = discord.FFmpegPCMAudio(stream_target, executable=FFMPEG_EXECUTABLE, before_options=before_opts, options=opts)
-            vol_source = NayumiVolumeTransformer(raw_source, volume_pct=self.volume)
+            buffered_source = NayumiBufferedAudioSource(raw_source, prebuffer_frames=50, max_buffer_frames=500)
+            vol_source = NayumiVolumeTransformer(buffered_source, volume_pct=self.volume)
             self.volume_transformer = vol_source
             self.current_source = vol_source
         except Exception as e:
@@ -3331,8 +3647,21 @@ class GuildPlayer:
                 pass
 
 
+        ch = getattr(self.voice_client, "channel", None)
+        ch_bitrate = getattr(ch, "bitrate", 64000) if ch else 64000
+        opt_bitrate = min(384, max(64, int(ch_bitrate / 1000)))
         try:
-
+            self.voice_client.play(
+                vol_source,
+                after=after_callback,
+                application="audio",
+                bitrate=opt_bitrate,
+                signal_type="music",
+                bandwidth="full",
+                fec=True,
+                expected_packet_loss=0.05
+            )
+        except TypeError:
             self.voice_client.play(vol_source, after=after_callback)
 
         except Exception as play_ex:
@@ -3411,116 +3740,83 @@ class GuildPlayer:
 
 
     async def on_track_end(self):
-
         # Do not discard/skip queue if voice client unexpectedly disconnected
-
         if not is_vc_connected(self.voice_client) and not is_vc_connected(self.guild.voice_client):
-
             return
 
+        if getattr(self, "skip_requested", False):
+            self.skip_requested = False
+            await self.play_next()
+            return
 
         if self.loop_mode == "track" and self.current:
-
             await self.play_track(self.current)
-
             return
 
-
         if self.loop_mode == "queue" and self.current:
-
             self.queue.append(self.current)
-
 
         await self.play_next()
 
 
     async def prefetch_autoplay(self):
-
         try:
-
             await asyncio.sleep(2)
-
             if not self.autoplay or not self.current or len(self.queue) > 0:
-
                 return
 
             recent_uris = [self.current.uri] + [t.uri for t in self.history[-10:]]
-
-            auto_track = await self.cog.find_autoplay_track(self.current, recent_uris, self.current.requester, player=self)
-
+            requester = getattr(self.current, 'requester', None) or self.bot.user
+            auto_track = await self.cog.find_autoplay_track(self.current, recent_uris, requester, player=self)
             if auto_track and len(self.queue) == 0:
-
                 self.prefetched_autoplay = auto_track
-
+                print(f"[Autoplay] Prefetched next track: '{auto_track.title}' by '{auto_track.author}'", flush=True)
         except asyncio.CancelledError:
-
             pass
-
         except Exception as e:
-
-            print(f"Prefetch error: {e}")
+            print(f"[Autoplay] Prefetch error: {e}", flush=True)
 
 
     async def play_next(self):
-
         if self.queue:
-
             next_track = self.queue.pop(0)
-
             await self.play_track(next_track)
-
         elif self.autoplay:
-
             finished_track = self.current
-
             self.current = None
+
+            # If prefetch task is running, wait up to 3.5s for it to finish
+            if not self.prefetched_autoplay and self.prefetch_task and not self.prefetch_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(self.prefetch_task), timeout=3.5)
+                except Exception:
+                    pass
 
             if self.prefetched_autoplay:
-
                 track_to_play = self.prefetched_autoplay
-
                 self.prefetched_autoplay = None
-
+                print(f"[Autoplay] Streaming prefetched track: '{track_to_play.title}' by '{track_to_play.author}'", flush=True)
                 await self.play_track(track_to_play)
-
-            elif finished_track:
-
-                try:
-
-                    recent_uris = [finished_track.uri] + [t.uri for t in self.history[-10:]]
-
-                    auto_track = await self.cog.find_autoplay_track(finished_track, recent_uris, finished_track.requester, player=self)
-
-                    if auto_track:
-
-                        await self.play_track(auto_track)
-
-                        return
-
-                except Exception as e:
-
-                    print(f"Autoplay fallback error: {e}")
-
-                if not is_247(self.guild.id):
-
-                    self.start_idle_timer()
-
             else:
-
+                ref_track = finished_track or (self.history[-1] if self.history else None)
+                if ref_track:
+                    try:
+                        recent_uris = [ref_track.uri] + [t.uri for t in self.history[-10:]]
+                        requester = getattr(ref_track, 'requester', None) or self.bot.user
+                        auto_track = await self.cog.find_autoplay_track(ref_track, recent_uris, requester, player=self)
+                        if auto_track:
+                            print(f"[Autoplay] Streaming fallback track: '{auto_track.title}' by '{auto_track.author}'", flush=True)
+                            await self.play_track(auto_track)
+                            return
+                    except Exception as e:
+                        print(f"[Autoplay] play_next fallback error: {e}", flush=True)
                 if not is_247(self.guild.id):
-
                     self.start_idle_timer()
-
         else:
-
             self.current = None
-
             if self.voice_client and getattr(self.voice_client, "channel", None):
-
                 self.bot.loop.create_task(self.cog.update_voice_channel_status(self.voice_client.channel.id, None))
-
             if not is_247(self.guild.id):
-
                 self.start_idle_timer()
 
 
@@ -3832,7 +4128,9 @@ class MusicControlView(discord.ui.View):
 
 
         skipped_track = player.current
-
+        player.skip_requested = True
+        if player.loop_mode == "track":
+            player.loop_mode = "off"
         player.voice_client.stop()
 
         embed = discord.Embed(
@@ -5902,365 +6200,193 @@ class VoiceIntentEngine:
         return None, {}
 
 
-class UserSpeechTracker:
-    """
-    Tracks real-time voice activity and collects clean, unclipped speech utterances.
-    Uses ultra-sensitive RMS energy detection (RMS >= 18) to capture even soft whispers and quiet speech,
-    and finishes chunking 220ms after the user stops speaking for instantaneous response.
-    """
-    def __init__(self, speech_rms_thresh: int = 18, silence_cutoff_s: float = 0.22):
-        self.speech_rms_thresh = speech_rms_thresh
-        self.silence_cutoff_s = silence_cutoff_s
-        self.pre_buffer = deque(maxlen=6)  # 6 * 20ms = 120ms pre-speech audio
-        self.speech_buffer = bytearray()
-        self.is_speaking = False
-        self.speech_frames = 0
-        self.last_speech_time = 0.0
-        self.last_packet_time = 0.0
+# Voice recognition audio sink and speech trackers removed for performance
 
-    def feed_frame(self, pcm_frame: bytes, current_time: float) -> Optional[bytes]:
-        import audioop
-        self.last_packet_time = current_time
-        try:
-            rms = audioop.rms(pcm_frame, 2)
-        except Exception:
-            rms = 0
-
-        if rms >= self.speech_rms_thresh:
-            if not self.is_speaking:
-                self.is_speaking = True
-                self.speech_frames = len(self.pre_buffer)
-                for f in self.pre_buffer:
-                    self.speech_buffer.extend(f)
-                self.pre_buffer.clear()
-            self.speech_buffer.extend(pcm_frame)
-            self.speech_frames += 1
-            self.last_speech_time = current_time
-
-            # Max utterance safety limit (4.5s)
-            if len(self.speech_buffer) >= 192000 * 4.5:
-                chunk = bytes(self.speech_buffer)
-                self.reset()
-                return chunk
-            return None
-        else:
-            if self.is_speaking:
-                self.speech_buffer.extend(pcm_frame)
-                if current_time - self.last_speech_time >= self.silence_cutoff_s:
-                    if self.speech_frames >= 3:  # At least ~60ms of voice
-                        chunk = bytes(self.speech_buffer)
-                        self.reset()
-                        return chunk
-                    else:
-                        self.reset()
-                        return None
-                return None
-            else:
-                self.pre_buffer.append(pcm_frame)
-                return None
-
-    def check_silence_timeout(self, current_time: float) -> Optional[bytes]:
-        if self.is_speaking:
-            if (current_time - self.last_speech_time >= self.silence_cutoff_s) or (current_time - self.last_packet_time >= self.silence_cutoff_s):
-                if self.speech_frames >= 3:
-                    chunk = bytes(self.speech_buffer)
-                    self.reset()
-                    return chunk
-                else:
-                    self.reset()
-                    return None
-        return None
-
-    def reset(self):
-        self.speech_buffer = bytearray()
-        self.is_speaking = False
-        self.speech_frames = 0
-
-
-class ContinuousVoiceCommandSink(voice_recv.AudioSink if voice_recv else object):
-    """
-    Continuous Real-Time 24/7 Voice Recognition Engine for Discord Voice Channels.
-    Captures all speech in VC (even soft whispers), transcribes in real-time,
-    logs user speech cleanly, and executes music commands automatically.
-    """
-    HALLUCINATIONS = {
-        "thanks for watching", "thanks for watching!", "thank you", "thank you.",
-        "see you next time", "see you next time!", "subtitles by", "subtitles by community",
-        "bye", "bye.", "you", "so", "the", "like and subscribe", "please subscribe",
-        "thank you for watching", "thank you for watching!", "thank you so much",
-        "thanks for listening", "thanks for listening!",
-        "hello everyone, welcome back to my channel.", "welcome back to my channel.",
-        "hello guys, welcome back to my channel.", "welcome to my channel.",
-        "hello everyone, welcome back to my channel", "welcome back to my channel",
-        "hello guys, welcome back to my channel", "welcome to my channel",
-        "hello everyone", "welcome back", "welcome back to my",
-        "subscribe to my channel", "like and share", "like share subscribe",
-        "see you in the next video", "amara.org", "watching", "listening",
-        "play hindi and english songs", "play hindi and english songs, pause",
-        "play hindi and english songs, pause.", "hindi and english songs",
-        "i'm sorry", "i'm sorry.", "sorry", "sorry.", "yeah", "yeah.", "yes", "yes.",
-        "no", "no.", "ok", "okay", "um", "uh", "huh", "hmm", "ah"
-    }
-
-    def __init__(self, cog: 'MusicCog', guild: discord.Guild, voice_client: Optional[Any] = None):
-        super().__init__()
-        self.cog = cog
-        self.guild = guild
-        self._vc_ref = voice_client
-        self.trackers: Dict[int, UserSpeechTracker] = {}
-        self.is_processing: Dict[int, bool] = {}
-        self._last_command_time: Dict[int, float] = {}
-        self._lock = threading.Lock()
-        self._whisper_model = None
-        self._whisper_lock = threading.Lock()
-        self._check_task = self.cog.bot.loop.create_task(self._silence_checker())
-        print(f"[24/7 VOICE SINK] ✅ ContinuousVoiceCommandSink active in '{guild.name}' 🎙️", flush=True)
-
-    def _get_whisper(self):
-        if self._whisper_model is None:
-            with self._whisper_lock:
-                if self._whisper_model is None:
-                    try:
-                        from faster_whisper import WhisperModel
-                        try:
-                            self._whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8", local_files_only=True)
-                        except Exception:
-                            self._whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-                    except Exception:
-                        pass
-        return self._whisper_model
-
-    def wants_opus(self) -> bool:
-        return False
-
-    def write(self, user: Optional[discord.Member], data: Any):
-        pcm_bytes = getattr(data, 'pcm', None)
-        if not pcm_bytes:
-            return
-
-        vc = self.guild.voice_client or self._vc_ref
-        ssrc = getattr(data.packet, 'ssrc', None) if hasattr(data, 'packet') else None
-
-        speaker = user
-        if not speaker and ssrc and vc and hasattr(vc, '_get_id_from_ssrc'):
-            uid = vc._get_id_from_ssrc(ssrc)
-            if uid:
-                speaker = self.guild.get_member(uid)
-
-        # Ignore bot's own voice and other bots
-        if speaker and (speaker.bot or (self.cog.bot.user and speaker.id == self.cog.bot.user.id)):
-            return
-
-        if speaker:
-            speaker_key = speaker.id
-        elif ssrc:
-            speaker_key = -ssrc
-        else:
-            speaker_key = 0
-
-        now = time.time()
-        chunk_to_process = None
-        with self._lock:
-            if speaker_key not in self.trackers:
-                self.trackers[speaker_key] = UserSpeechTracker()
-            tracker = self.trackers[speaker_key]
-            chunk_to_process = tracker.feed_frame(pcm_bytes, now)
-
-        if chunk_to_process:
-            self.cog.bot.loop.create_task(self._process_user_audio(speaker_key, chunk_to_process))
-
-    async def _silence_checker(self):
-        """Periodically flushes completed speech utterances when voice ends."""
-        while not self.cog.bot.is_closed():
-            try:
-                await asyncio.sleep(0.02)
-                now = time.time()
-                to_process = []
-                with self._lock:
-                    for speaker_key, tracker in list(self.trackers.items()):
-                        chunk = tracker.check_silence_timeout(now)
-                        if chunk:
-                            to_process.append((speaker_key, chunk))
-                for speaker_key, chunk in to_process:
-                    self.cog.bot.loop.create_task(self._process_user_audio(speaker_key, chunk))
-            except Exception:
-                pass
-
-    async def _process_user_audio(self, speaker_key: int, audio_data: bytes):
-        """Processes real-time audio chunk, transcribes with ultra-fast STT, logs user speech, and executes command."""
-        if not audio_data or len(audio_data) < 4000:
-            return
-
-        with self._lock:
-            if self.is_processing.get(speaker_key, False):
-                return
-            self.is_processing[speaker_key] = True
-
-        try:
-            member = None
-            vc = self.guild.voice_client or self._vc_ref
-
-            if speaker_key > 0:
-                member = self.guild.get_member(speaker_key)
-                if not member:
-                    try:
-                        member = await self.guild.fetch_member(speaker_key)
-                    except Exception:
-                        member = self.cog.bot.get_user(speaker_key)
-            elif speaker_key < 0:
-                ssrc = -speaker_key
-                if vc and hasattr(vc, '_get_id_from_ssrc'):
-                    uid = vc._get_id_from_ssrc(ssrc)
-                    if uid:
-                        member = self.guild.get_member(uid)
-
-            # Fallback 1: Any human member in current VC
-            if not member and vc and getattr(vc, 'channel', None):
-                humans = [m for m in vc.channel.members if not m.bot]
-                if humans:
-                    member = humans[0]
-
-            # Fallback 2: Any human member in any voice channel in this guild
-            if not member:
-                for vch in self.guild.voice_channels:
-                    humans = [m for m in vch.members if not m.bot]
-                    if humans:
-                        member = humans[0]
-                        break
-
-            # Fallback 3: Guild owner or non-bot member
-            if not member:
-                member = self.guild.owner or next((m for m in self.guild.members if not m.bot), None)
-
-            display_name = getattr(member, 'display_name', f"Speaker-{abs(speaker_key)}") if member else f"Speaker-{abs(speaker_key)}"
-
-            def _transcribe() -> Optional[Tuple[str, Optional[str], Dict[str, Any]]]:
-                try:
-                    import audioop
-                    import numpy as np
-                    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-                    clean_len = (len(audio_data) // 4) * 4
-                    if clean_len == 0:
-                        return None
-                    raw_chunk = audio_data[:clean_len]
-
-                    # 48kHz stereo -> 48kHz mono
-                    mono_48k = audioop.tomono(raw_chunk, 2, 0.5, 0.5)
-                    # 48kHz mono -> 16kHz mono
-                    resampled_16k, _ = audioop.ratecv(mono_48k, 2, 1, 48000, 16000, None)
-
-                    max_val = audioop.max(resampled_16k, 2)
-                    rms_val = audioop.rms(resampled_16k, 2)
-
-                    # Only reject absolute digital silence
-                    if max_val < 25 or rms_val < 4:
-                        return None
-
-                    # Ultra-sensitive AGC: Boosts quiet speech and whispers up to 45x cleanly to 24000 peak
-                    boost_factor = min(45.0, max(1.0, 24000.0 / max(float(max_val), 1.0)))
-                    boosted_16k = audioop.mul(resampled_16k, 2, boost_factor)
-
-                    recognized_text = None
-
-                    # 1. Parallel Dual-Engine Google Speech Recognition (Fastest ~150ms parallel HTTP query)
-                    try:
-                        import speech_recognition as sr
-                        r = sr.Recognizer()
-                        r.energy_threshold = 30
-                        r.dynamic_energy_threshold = False
-                        audio_obj = sr.AudioData(boosted_16k, 16000, 2)
-
-                        def _query_google(lang: str) -> Optional[str]:
-                            try:
-                                txt = r.recognize_google(audio_obj, language=lang)
-                                if txt and len(txt.strip()) > 0:
-                                    clean = txt.strip().lower().rstrip('.!?')
-                                    if clean not in self.HALLUCINATIONS:
-                                        return txt.strip()
-                            except Exception:
-                                pass
-                            return None
-
-                        with ThreadPoolExecutor(max_workers=2) as pool:
-                            futs = {pool.submit(_query_google, lang): lang for lang in ["en-IN", "hi-IN"]}
-                            candidates = []
-                            for f in as_completed(futs):
-                                res = f.result()
-                                if res:
-                                    intent, params = VoiceIntentEngine.parse_intent(res)
-                                    if intent:
-                                        return (res, intent, params)
-                                    candidates.append(res)
-                            if candidates:
-                                recognized_text = candidates[0]
-                    except Exception:
-                        pass
-
-                    # 2. Local Fallback: Faster-Whisper
-                    if not recognized_text:
-                        try:
-                            w_model = self._get_whisper()
-                            if w_model:
-                                audio_float32 = np.frombuffer(boosted_16k, dtype=np.int16).astype(np.float32) / 32768.0
-                                segments, _ = w_model.transcribe(
-                                    audio_float32,
-                                    beam_size=1,
-                                    temperature=0.0,
-                                    condition_on_previous_text=False,
-                                    vad_filter=False
-                                )
-                                w_text = " ".join([s.text for s in list(segments)]).strip()
-                                if w_text and len(w_text) > 0:
-                                    w_clean = w_text.lower().rstrip('.!?')
-                                    if w_clean not in self.HALLUCINATIONS:
-                                        recognized_text = w_text.strip()
-                        except Exception:
-                            pass
-
-                    if recognized_text:
-                        intent, params = VoiceIntentEngine.parse_intent(recognized_text)
-                        return (recognized_text, intent, params)
-
-                    return None
-                except Exception as ex:
-                    print(f"[VC Audio DSP Error] {ex}", flush=True)
-                    return None
-
-            result = await asyncio.to_thread(_transcribe)
-            if result:
-                text, intent, params = result
-                text = " ".join(text.split()).strip()
-                if not text:
-                    return
-
-                with self._lock:
-                    self._last_command_time[speaker_key] = time.time()
-                    if member:
-                        self._last_command_time[member.id] = time.time()
-
-                # Clean live speech terminal output
-                print(f"[VOICE] {display_name}: {text}", flush=True)
-
-                if intent:
-                    query_str = params.get('query') or params.get('level') or params.get('action') or params.get('mode') or ''
-                    param_info = f" | Query: {query_str}" if query_str != '' else ""
-                    print(f"[VOICE] ⚡ Intent: {intent}{param_info}", flush=True)
-                    print(f"[VOICE] ⚙ Executing {intent}...", flush=True)
-                    target_ch = getattr(member.voice.channel, 'text_channel', None) or member.voice.channel if (member and hasattr(member, 'voice') and member.voice and member.voice.channel) else None
-                    await self.cog.handle_voice_command(self.guild, member, text, target_channel=target_ch)
-                    print(f"[VOICE] ✅ {intent} executed successfully.\n", flush=True)
-        finally:
-            with self._lock:
-                self.is_processing[speaker_key] = False
-
-    def cleanup(self):
-        task = getattr(self, '_check_task', None)
-        if task and not task.done():
-            task.cancel()
 
 
 # -------------------- MAIN MUSIC COG --------------------
+
+def parse_duration_str(dur_str: str) -> int:
+    if not dur_str:
+        return 0
+    parts = str(dur_str).strip().split(':')
+    try:
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+        elif len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    except Exception:
+        pass
+    return 0
+
+
+def fetch_youtube_music_radio_candidates(video_id: str) -> list:
+    """Fetches YouTube's native radio recommendations (just like YouTube/YT Music autoplay)."""
+    if not video_id:
+        return []
+    url = 'https://music.youtube.com/youtubei/v1/next'
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Content-Type': 'application/json',
+        'Origin': 'https://music.youtube.com',
+        'Referer': 'https://music.youtube.com/'
+    }
+    payload = {
+        'context': {
+            'client': {
+                'clientName': 'WEB_REMIX',
+                'clientVersion': '1.20240101.01.00',
+                'hl': 'en',
+                'gl': 'IN'
+            }
+        },
+        'videoId': video_id,
+        'playlistId': 'RDAMVM' + video_id,
+        'enablePersistentPlaylistPanel': True,
+        'isAudioOnly': True
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=7)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        tabs = data.get('contents', {}).get('singleColumnMusicWatchNextResultsRenderer', {}).get('tabbedRenderer', {}).get('watchNextTabbedResultsRenderer', {}).get('tabs', [])
+        candidates = []
+        for tab in tabs:
+            content = tab.get('tabRenderer', {}).get('content', {})
+            queue_renderer = content.get('musicQueueRenderer', {})
+            tracks = queue_renderer.get('content', {}).get('playlistPanelRenderer', {}).get('contents', [])
+            for t in tracks:
+                rend = t.get('playlistPanelVideoRenderer', {})
+                if not rend:
+                    continue
+                v_id = rend.get('videoId')
+                if not v_id:
+                    continue
+                title_obj = rend.get('title', {})
+                title = title_obj.get('runs', [{}])[0].get('text') or title_obj.get('simpleText', '')
+                if not title:
+                    continue
+                by_obj = rend.get('longBylineText', {}) or rend.get('shortBylineText', {})
+                author = by_obj.get('runs', [{}])[0].get('text') if by_obj.get('runs') else 'Artist'
+                dur_obj = rend.get('lengthText', {})
+                dur_str = dur_obj.get('runs', [{}])[0].get('text') if dur_obj.get('runs') else dur_obj.get('simpleText', '')
+                dur_sec = parse_duration_str(dur_str)
+
+                thumbs = rend.get('thumbnail', {}).get('thumbnails', [])
+                thumb_url = thumbs[-1].get('url') if thumbs else f'https://i.ytimg.com/vi/{v_id}/hqdefault.jpg'
+
+                candidates.append({
+                    'id': v_id,
+                    'title': title,
+                    'author': author,
+                    'url': f'https://www.youtube.com/watch?v={v_id}',
+                    'duration': dur_sec,
+                    'thumbnail': thumb_url
+                })
+        return candidates
+    except Exception as exc:
+        return []
+
+
+def extract_youtube_video_id(track) -> str:
+    """Extracts or discovers the YouTube video ID for a track."""
+    if track and getattr(track, 'uri', None):
+        m = re.search(r'(?:v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})', track.uri)
+        if m:
+            return m.group(1)
+    if track and getattr(track, 'title', None):
+        q = f"{track.title} {getattr(track, 'author', '') or ''}".strip()
+        flat_opts = {'quiet': True, 'extract_flat': True, 'socket_timeout': 5}
+        with yt_dlp.YoutubeDL(flat_opts) as ydl:
+            try:
+                res = ydl.extract_info(f'ytsearch1:{q}', download=False)
+                entries = res.get('entries', []) if res else []
+                if entries and entries[0] and entries[0].get('id'):
+                    return entries[0].get('id')
+            except Exception:
+                pass
+    return None
+
+
+HARYANVI_KEYWORDS = {
+    "haryanvi", "haryana", "banjaare", "bairan", "barsaat", "aman jakhar", "sintaa",
+    "gold e gill", "mannu pahari", "vipin sihag", "diler kharkiya", "diler", "kharkiya", "masoom sharma", "masoom",
+    "renuka panwar", "renuka", "gulzaar chhaniwala", "gulzaar", "chhaniwala", "amit saini rohtakiya",
+    "amit saini", "rohtakiya", "khasa aala chahar", "khasa aala", "kd desi rockstar", "md", "md kd",
+    "raju punjabi", "sapna choudhary", "sapna", "vicky kajla", "sumit goswami", "bintu pabra",
+    "shiva choudhary", "dc madana", "tarun panwar", "pranjal dahiya", "pranjal", "naveen punia",
+    "ruchika jangid", "ruchika", "monika sharma", "surender romio", "manisha sharma", "uk haryanvi",
+    "chhatri", "gandharv", "white hill dhaakad", "desi records", "nav haryanvi", "sonar",
+    "billa sonipat ala", "billa sonipat", "ajay bhagta", "sukh deswal", "khushi baliyan",
+    "vikram sarkar", "sansar mahla", "ajesh kumar", "shaili raturi", "mohit chahar", "syahi",
+    "kaushal music", "sonika singh", "pradeep solanki", "satyam verma", "swati shukla",
+    "nyn music", "mohito", "jaizeey music", "khandela music",
+    "rahul saini", "raaji", "kashish records", "sonotek", "sonotek music", "geet mp3 haryanvi",
+    "pure desi haryanvi", "music mistri", "all good music", "gem tunes haryanvi", "mor music",
+    "maina haryanvi", "hulbit song", "heart buzz", "mr dutt", "tanu rawat", "alijaan",
+    "komal jangra", "shruti phogat", "sinta bhai", "mahi dhaka", "aala", "aali", "chhori",
+    "chhora", "chhore", "bahu", "suaadu", "dhaakad", "dhatir music", "vats records",
+    "shree ram music", "desi geet", "desirockstar", "ndj music", "superline music"
+}
+
+SAD_KEYWORDS = {
+    "sad", "barsaat", "barish", "dard", "judai", "bewafa", "dhokha", "rone", "gam",
+    "alone", "broken", "heartbreak", "emotional", "pain", "tears", "duriya", "yaad",
+    "judayi", "tanhai", "chhod", "mar gaye", "aawara", "panchhi", "majboor", "tut gya",
+    "dil tut", "dhoke", "khuda", "zindagi", "heer", "zehar", "ishq", "bairan", "rove na",
+    "rove", "aansu", "anshu", "anshoo", "yaad avegi", "yaad aavegi", "chhod gye", "chod gye",
+    "pujari", "haaye re", "bhagwan thodi hai", "tu aaja ne", "dil tod", "marjani", "akeli",
+    "akela", "vaade", "duniya te door", "apne", "mout", "keemat", "tabaah", "ro rha hu",
+    "saali naagan", "galti", "ummid", "neend na aandi", "takiya", "ke haal", "toot sa gaya",
+    "rovegi", "toy", "teri yaad", "rehn de madam", "father saab", "babu", "likh dega"
+}
+
+def detect_genre_and_mood(title: str, artist: str = "") -> Tuple[str, str]:
+    text = f"{title} {artist}".lower()
+    genre = "global"
+    if any(k in text for k in HARYANVI_KEYWORDS):
+        genre = "haryanvi"
+    elif any(k in text for k in ["punjabi", "bhangra", "karan aujla", "shubh", "sidhu moose", "ap dhillon", "diljit"]):
+        genre = "punjabi"
+    elif any(k in text for k in ["bhojpuri", "khesari", "pawan singh", "silpi raj", "shilpi raj"]):
+        genre = "bhojpuri"
+    elif any(k in text for k in ["arijit", "pritam", "jubin", "darshan raval", "bollywood", "hindi"]):
+        genre = "bollywood"
+    elif any(k in text for k in ["anuv jain", "aditya rikhari", "prateek kuhad", "indie", "chill"]):
+        genre = "indie"
+    elif any(k in text for k in ["kr$na", "krsna", "seedhe maut", "divine", "emiway", "dhh"]):
+        genre = "dhh"
+
+    mood = "general"
+    if any(k in text for k in SAD_KEYWORDS):
+        mood = "sad"
+    elif any(k in text for k in ["party", "dance", "dj", "dhol", "bhangra", "club", "remix", "bass"]):
+        mood = "party"
+    elif any(k in text for k in ["love", "romantic", "pyaar", "ishq", "mohabbat", "dil"]):
+        mood = "romantic"
+        
+    return genre, mood
+
+def is_track_matching_genre(title: str, author: str, target_genre: str) -> bool:
+    if target_genre == "global":
+        return True
+    text = f"{title} {author}".lower()
+    if target_genre == "haryanvi":
+        return any(k in text for k in HARYANVI_KEYWORDS)
+    elif target_genre == "punjabi":
+        return any(k in text for k in ["punjabi", "bhangra", "karan aujla", "shubh", "sidhu moose", "ap dhillon", "diljit", "speed records", "geet mp3"])
+    elif target_genre == "bhojpuri":
+        return any(k in text for k in ["bhojpuri", "khesari", "pawan singh", "silpi raj", "shilpi raj", "wave music"])
+    elif target_genre == "bollywood":
+        return any(k in text for k in ["arijit", "pritam", "jubin", "darshan raval", "bollywood", "hindi", "t-series", "zee music", "sony music"])
+    elif target_genre == "indie":
+        return any(k in text for k in ["anuv jain", "aditya rikhari", "prateek kuhad", "indie", "chill"])
+    elif target_genre == "dhh":
+        return any(k in text for k in ["kr$na", "krsna", "seedhe maut", "divine", "emiway", "dhh", "hip hop"])
+    return True
+
+
 
 class MusicCog(commands.Cog, name="Music"):
     """
@@ -6306,7 +6432,7 @@ class MusicCog(commands.Cog, name="Music"):
     async def connect_voice_channel(self, channel: discord.VoiceChannel, timeout: float = 20.0) -> Optional[discord.VoiceClient]:
         """
         Connects to a voice channel with clean error handling and zero zombie states.
-        Automatically attaches 24/7 Continuous Voice Recognition Sink.
+        Uses standard discord.VoiceClient with self_deaf=True for maximum stability and minimal resource usage.
         """
         player = self.get_player(channel.guild)
         existing_vc = channel.guild.voice_client
@@ -6314,25 +6440,11 @@ class MusicCog(commands.Cog, name="Music"):
         if existing_vc and is_vc_connected(existing_vc):
             if existing_vc.channel and existing_vc.channel.id == channel.id:
                 player.voice_client = existing_vc
-                if voice_recv and isinstance(existing_vc, voice_recv.VoiceRecvClient) and not existing_vc.is_listening():
-                    try:
-                        sink = ContinuousVoiceCommandSink(self, channel.guild, voice_client=existing_vc)
-                        existing_vc.listen(sink)
-                        player.voice_sink = sink
-                    except Exception as s_err:
-                        print(f"[VOICE SINK ATTACH ERROR] {s_err}", flush=True)
                 return existing_vc
             else:
                 try:
                     await existing_vc.move_to(channel)
                     player.voice_client = existing_vc
-                    if voice_recv and isinstance(existing_vc, voice_recv.VoiceRecvClient) and not existing_vc.is_listening():
-                        try:
-                            sink = ContinuousVoiceCommandSink(self, channel.guild, voice_client=existing_vc)
-                            existing_vc.listen(sink)
-                            player.voice_sink = sink
-                        except Exception as s_err:
-                            print(f"[VOICE SINK ATTACH ERROR] {s_err}", flush=True)
                     return existing_vc
                 except Exception as m_err:
                     print(f"[VOICE MOVE ERROR] {m_err}", flush=True)
@@ -6345,17 +6457,16 @@ class MusicCog(commands.Cog, name="Music"):
                 pass
             await asyncio.sleep(0.5)
 
-        # Connect with VoiceRecvClient for real-time 24/7 voice receiving
+        # Connect with standard VoiceClient (self_deaf=True for bandwidth & stability)
         vc = None
-        connect_cls = voice_recv.VoiceRecvClient if voice_recv else discord.VoiceClient
         try:
-            vc = await channel.connect(timeout=timeout, reconnect=True, self_deaf=False, cls=connect_cls)
+            vc = await channel.connect(timeout=timeout, reconnect=True, self_deaf=True)
         except discord.ClientException as ce:
             vc = channel.guild.voice_client
             if not vc or not is_vc_connected(vc):
                 try:
                     await asyncio.sleep(1.0)
-                    vc = await channel.connect(timeout=timeout, reconnect=True, self_deaf=False, cls=connect_cls)
+                    vc = await channel.connect(timeout=timeout, reconnect=True, self_deaf=True)
                 except Exception as ce2:
                     vc = channel.guild.voice_client
                     if not vc or not is_vc_connected(vc):
@@ -6366,7 +6477,7 @@ class MusicCog(commands.Cog, name="Music"):
             if not vc or not is_vc_connected(vc):
                 try:
                     await asyncio.sleep(1.0)
-                    vc = await channel.connect(timeout=timeout, reconnect=True, self_deaf=False, cls=connect_cls)
+                    vc = await channel.connect(timeout=timeout, reconnect=True, self_deaf=True)
                 except Exception as ex2:
                     vc = channel.guild.voice_client
                     if not vc or not is_vc_connected(vc):
@@ -6375,13 +6486,6 @@ class MusicCog(commands.Cog, name="Music"):
 
         if vc:
             player.voice_client = vc
-            if voice_recv and isinstance(vc, voice_recv.VoiceRecvClient) and not vc.is_listening():
-                try:
-                    sink = ContinuousVoiceCommandSink(self, channel.guild, voice_client=vc)
-                    vc.listen(sink)
-                    player.voice_sink = sink
-                except Exception as sink_err:
-                    print(f"[VOICE SINK ATTACH ERROR] {sink_err}", flush=True)
 
         return vc
 
@@ -6424,14 +6528,6 @@ class MusicCog(commands.Cog, name="Music"):
                                 await vc.move_to(channel)
                             except Exception:
                                 pass
-                        # Ensure 24/7 sink is listening
-                        if voice_recv and isinstance(vc, voice_recv.VoiceRecvClient) and not vc.is_listening():
-                            try:
-                                sink = ContinuousVoiceCommandSink(self, guild, voice_client=vc)
-                                vc.listen(sink)
-                                player.voice_sink = sink
-                            except Exception as s_err:
-                                print(f"[VOICE SINK ATTACH ERROR] {s_err}", flush=True)
                         continue
 
                     player.is_connecting = True
@@ -7325,9 +7421,10 @@ class MusicCog(commands.Cog, name="Music"):
 
 
         elif custom_id == "m_btn_skip":
-
             skipped_track = player.current
-
+            player.skip_requested = True
+            if player.loop_mode == "track":
+                player.loop_mode = "off"
             player.voice_client.stop()
 
             if not interaction.response.is_done():
@@ -8120,27 +8217,36 @@ class MusicCog(commands.Cog, name="Music"):
 
         is_url = search_target.startswith("http://") or search_target.startswith("https://")
 
+        # Smart Viral / Trending Search Overrides (Matches latest trending hit: "barsaat" -> Banjaare)
+        if not is_url:
+            norm_q = search_target.lower().strip()
+            if norm_q in ['barsaat', 'barsat', 'barshat', 'barsaat song', 'barsat song', 'barsat new song', 'barsaat new song', 'barsaat song trending']:
+                search_target = "barsaat banjaare"
 
         is_yt_title = any(k in search_target.lower() for k in ['|', 'visualizer', 'official', 'teaser', 'remix', 'prod.', 'prod by', 'feat.', 'ft.'])
 
 
         # Smart AI Lyrics Identification (Only when query is genuinely lyrics without title markers)
-
         if not is_url and not is_yt_title and len(search_target.split()) >= 4:
-
             try:
-
                 resolved_song = await self.resolve_lyrics_to_song(search_target)
-
                 if resolved_song and resolved_song.lower() != search_target.lower():
-
                     print(f"[SEARCH TRACK] Lyrics resolved: '{search_target}' -> '{resolved_song}'", flush=True)
-
+                    search_target = resolved_song
             except Exception as e:
                 pass
 
         # ---------------- NATIVE RESOLVER & DIRECT SEARCH ----------------
         loop = asyncio.get_event_loop()
+
+        # Tier 1: JioSaavn Studio 320kbps CD Lossless Master Direct Search (Official releases, zero video skits/dialogues)
+        if not is_url:
+            try:
+                saavn_tr = await self.resolve_saavn_track(search_target, requester)
+                if saavn_tr and saavn_tr.direct_url:
+                    return saavn_tr
+            except Exception as s_err:
+                print(f"[search_track] JioSaavn direct resolve notice: {s_err}", flush=True)
 
         # Direct handling for YouTube URLs (including youtu.be, shorts, music.youtube.com)
         yt_id_match = re.search(r'(?:(?:v=|shorts\/|youtu\.be\/|\/v\/|\/embed\/))([0-9A-Za-z_-]{11})', search_target) if is_url else None
@@ -8409,69 +8515,63 @@ class MusicCog(commands.Cog, name="Music"):
             # Smart query tuning: append 'song' for short colloquial words without music terms
 
             yt_query = search_target
-
             if not any(k in search_target.lower() for k in ['song', 'track', 'music', 'video', 'official', 'lyrics', 'audio', 'remix', 'lofi']):
-
                 yt_query = f"{search_target} song"
 
-
             for use_ck in [False, True]:
-
                 try:
-
                     search_opts = get_ytdl_opts({
-
                         'format': 'bestaudio/best',
-
                         'quiet': True,
-
                         'extract_flat': False,
-
                         'noplaylist': True,
-
                         'socket_timeout': 15,
-
                     }, use_cookies=use_ck)
-
                     with yt_dlp.YoutubeDL(search_opts) as ydl:
-
-                        info = ydl.extract_info(f"ytsearch1:{yt_query}", download=False)
-
+                        info = ydl.extract_info(f"ytsearch5:{yt_query}", download=False)
                         if info and 'entries' in info and info['entries']:
-
+                            valid_entries = []
+                            for e in info['entries']:
+                                if not e:
+                                    continue
+                                e_t = e.get('title') or ''
+                                e_u = e.get('uploader') or e.get('channel') or ''
+                                e_dur = int(e.get('duration') or 0)
+                                if e_dur > 0 and (e_dur < 45 or e_dur > 1200) and not any(w in search_target.lower() for w in ['mix', 'hour', 'album', 'podcast']):
+                                    continue
+                                if is_unwanted_remake(e_t, search_target, e_u):
+                                    continue
+                                score = 0
+                                if '- topic' in e_u.lower():
+                                    score += 40
+                                if 'official audio' in e_t.lower() or 'audio' in e_t.lower():
+                                    score += 25
+                                if 'official video' in e_t.lower() or 'official music video' in e_t.lower():
+                                    score += 20
+                                valid_entries.append((score, e))
+                            if valid_entries:
+                                valid_entries.sort(key=lambda x: x[0], reverse=True)
+                                return valid_entries[0][1]
                             return info['entries'][0]
-
                         elif info:
-
                             return info
-
                 except Exception as e:
-
                     print(f"yt-dlp extract search error: {e}", flush=True)
 
-
             # Fast SoundCloud Search Fallback
-
             try:
-
                 sc_opts = get_sc_opts({'extract_flat': True})
-
                 with yt_dlp.YoutubeDL(sc_opts) as ydl:
-
-                    info = ydl.extract_info(f"scsearch1:{search_target}", download=False)
-
+                    info = ydl.extract_info(f"scsearch5:{search_target}", download=False)
                     if info and 'entries' in info and info['entries']:
-
+                        for e in info['entries']:
+                            if e and not is_unwanted_remake(e.get('title', ''), search_target, e.get('uploader', '')):
+                                return e
                         return info['entries'][0]
-
                     elif info:
-
                         return info
-
             except Exception as ex:
-
                 print(f"SoundCloud fallback search error: {ex}")
-
 
             return None
 
@@ -8564,249 +8664,145 @@ class MusicCog(commands.Cog, name="Music"):
         return None
 
 
-    async def find_autoplay_track(self, current_track: Track, recent_uris: List[str], requester: discord.User, player: Optional[GuildPlayer] = None) -> Optional[Track]:
 
+    async def find_autoplay_track(self, current_track: Track, recent_uris: List[str], requester: Optional[discord.User] = None, player: Optional[GuildPlayer] = None) -> Optional[Track]:
+        """
+        State-of-the-art Autoplay Recommendation Engine ported from Groove-Music.
+        Powered by Last.fm musical similarity graph with multi-tier search engine resolution
+        and fallback to YouTube native mix / radio.
+        """
         loop = asyncio.get_event_loop()
 
+        raw_title = current_track.title or ""
+        raw_author = current_track.author or ""
 
-        clean_title = clean_for_search(current_track.title)
+        clean_author = clean_track_author(raw_author)
+        smart_artist = extract_smart_artist(raw_title, clean_author)
+        target_artist = smart_artist if smart_artist and smart_artist != "Unknown" else clean_author
 
-        artist = extract_smart_artist(current_track.title, current_track.author or "")
+        # Clean title for recommendation lookup (strip bracketed text, noise tokens)
+        clean_title = re.sub(r'[\(\[\{][^\)\]\}]*[\)\]\}]', '', raw_title)
+        clean_title = re.sub(r'(?i)\b(official|video|audio|lyric|lyrics|music|song|full|hd|4k|8k|version|remix|edit|remaster)\b', '', clean_title)
+        clean_title = re.sub(r'\s+', ' ', clean_title).strip()
 
-
+        # Build excluded URI and title sets
         excluded_uris = set(recent_uris or [])
+        if current_track.uri:
+            excluded_uris.add(current_track.uri)
 
-        excluded_titles = set()
-
+        excluded_titles: List[str] = [raw_title]
         if player:
-
             excluded_uris.update(player.played_uris)
-
-            excluded_titles.update(player.played_titles)
-
-        norm_current = re.sub(r'[^a-zA-Z0-9]', '', (current_track.title or "").lower())
-
-        if norm_current:
-
-            excluded_titles.add(norm_current)
-
-        norm_clean = re.sub(r'[^a-zA-Z0-9]', '', clean_title.lower())
-
-        if norm_clean:
-
-            excluded_titles.add(norm_clean)
-
-
-        related_artists, search_tag = get_vibe_suggestions(clean_title, artist)
-
-
-        # 1. Primary Engine: YouTube Related Tracks
-
-
-        def _extract_candidates():
-
-            flat_opts = get_ytdl_opts({
-
-                'quiet': True,
-
-                'extract_flat': True,
-
-                'playlist_items': '1:8',
-
-                'noplaylist': False,
-
-                'socket_timeout': 15,
-
-            })
-
-            targets = []
-
-            if related_artists:
-
-                sample_rel = random.sample(related_artists, min(2, len(related_artists)))
-
-                for rel_a in sample_rel:
-
-                    targets.append(f"ytsearch6:{rel_a} latest songs")
-
-            targets.append(f"ytsearch6:{search_tag}")
-
-            if artist and artist != "Trending Hits":
-
-                targets.append(f"ytsearch6:{clean_title} {artist} songs")
-
-
-            candidates = []
-
-            with yt_dlp.YoutubeDL(flat_opts) as ydl:
-
-                for target in targets:
-
-                    try:
-
-                        res = ydl.extract_info(target, download=False)
-
-                        entries = res.get('entries', []) if res else []
-
-                        for entry in entries:
-
-                            if not entry:
-
-                                continue
-
-                            v_id = entry.get('id')
-
-                            raw_u = entry.get('url') or entry.get('webpage_url')
-
-                            if v_id and not (raw_u and raw_u.startswith('http')):
-
-                                full_url = f"https://www.youtube.com/watch?v={v_id}"
-
-                            elif raw_u and raw_u.startswith('http'):
-
-                                full_url = raw_u
-
-                            elif v_id:
-
-                                full_url = f"https://www.youtube.com/watch?v={v_id}"
-
-                            else:
-
-                                continue
-
-
-                            t = entry.get('title') or ""
-
-                            if not t:
-
-                                continue
-
-                            art = entry.get('uploader') or entry.get('channel') or artist or "Artist"
-
-                            if is_unwanted_remake(t, "", art):
-
-                                continue
-
-                            dur = int(entry.get('duration') or 0)
-
-                            title_low = t.lower()
-
-                            norm_t = re.sub(r'[^a-zA-Z0-9]', '', title_low)
-
-
-                            if any(w in title_low for w in ["1 hour", "10 hours", "nonstop", "full album", "podcast", "jukebox", "compilation", "all songs", "mashup"]):
-
-                                continue
-
-                            if dur > 0 and (dur < 75 or dur > 480):
-
-                                continue
-
-                            if full_url in excluded_uris or norm_t in excluded_titles:
-
-                                continue
-
-                            if any(c['url'] == full_url for c in candidates):
-
-                                continue
-
-
-                            thumb = entry.get('thumbnail') or ""
-
-                            if not thumb and entry.get('thumbnails'):
-
-                                thumb = entry['thumbnails'][-1].get('url', '')
-
-
-                            c_score = score_track_candidate(entry, f"{clean_title} {artist}")
-
-                            if any(ra.lower() in t.lower() or ra.lower() in art.lower() for ra in related_artists):
-
-                                c_score += 60.0
-
-                            elif artist.lower() in t.lower() or artist.lower() in art.lower():
-
-                                c_score += 40.0
-
-
-                            if c_score > 0:
-
-                                candidates.append({
-
-                                    'title': t,
-
-                                    'url': full_url,
-
-                                    'author': art,
-
-                                    'duration': dur,
-
-                                    'thumbnail': thumb,
-
-                                    'score': c_score
-
-                                })
-
-                            if len(candidates) >= 10:
-
-                                break
-
-                    except Exception as ex:
-
-                        print(f"Autoplay candidate extraction error: {ex}")
-
-                    if len(candidates) >= 8:
-
-                        break
-
-            return candidates
-
-
+            for h in getattr(player, 'history', []):
+                if hasattr(h, 'uri') and h.uri:
+                    excluded_uris.add(h.uri)
+                if hasattr(h, 'title') and h.title:
+                    excluded_titles.append(h.title)
+
+        recommendations: List[Dict[str, str]] = []
+
+        # -------------------------------------------------------------
+        # TIER 1: LAST.FM SIMILAR TRACKS & ARTISTS (GROOVE-MUSIC ENGINE)
+        # -------------------------------------------------------------
         try:
+            # 1. Primary: Direct track similarity from Last.fm
+            similar_tracks = await lastfm_client.get_similar_tracks(target_artist, clean_title, limit=10)
+            if similar_tracks:
+                recommendations.extend(similar_tracks)
 
-            candidates = await loop.run_in_executor(None, _extract_candidates)
+            # 2. Secondary: If no similar tracks, get top tracks of similar artists
+            if not recommendations and target_artist:
+                similar_artists = await lastfm_client.get_similar_artists(target_artist, limit=4)
+                for sim_art in similar_artists:
+                    art_top = await lastfm_client.get_top_tracks(sim_art, limit=3)
+                    recommendations.extend(art_top)
 
-            if candidates:
+            # 3. Tertiary: Top tracks of the artist if still empty
+            if not recommendations and target_artist:
+                top_self = await lastfm_client.get_top_tracks(target_artist, limit=5)
+                recommendations.extend(top_self)
 
-                candidates.sort(key=lambda x: x['score'], reverse=True)
+            # Shuffle recommendations for natural variety (just like Groove-Music)
+            if recommendations:
+                random.shuffle(recommendations)
+        except Exception as lfm_err:
+            print(f"[Autoplay] Last.fm recommendation error: {lfm_err}", flush=True)
 
-                chosen = candidates[0] if len(candidates) == 1 else random.choice(candidates[:min(3, len(candidates))])
+        # -------------------------------------------------------------
+        # TIER 2: YOUTUBE MUSIC NATIVE RADIO & MIX (FALLBACK ENGINE)
+        # -------------------------------------------------------------
+        fallback_queries: List[str] = []
+        vid_id = extract_youtube_video_id(current_track)
+        if vid_id:
+            try:
+                ytm_candidates = await loop.run_in_executor(None, fetch_youtube_music_radio_candidates, vid_id)
+                for cand in ytm_candidates:
+                    if cand.get('title') and cand.get('author'):
+                        fallback_queries.append(f"{cand['author']} {cand['title']}")
+            except Exception:
+                pass
 
-                track = Track(
+        fallback_queries.extend([
+            f"ytsearch8:Mix - {clean_title}",
+            f"ytsearch8:{target_artist} songs" if target_artist else None,
+            f"ytsearch8:{clean_title} similar songs",
+            f"ytsearch8:{clean_title} {target_artist}"
+        ])
+        fallback_queries = [q for q in fallback_queries if q]
 
-                    title=chosen['title'],
+        # -------------------------------------------------------------
+        # TIER 3: RESOLVE CANDIDATES & STRICT DEDUPLICATION
+        # -------------------------------------------------------------
+        search_queries = [f"{r['author']} {r['title']}" for r in recommendations if r.get('title')]
 
-                    uri=chosen['url'],
+        def is_valid_candidate(t: Track) -> bool:
+            if not t or not t.uri or not t.title:
+                return False
+            if t.uri in excluded_uris:
+                return False
+            dur = getattr(t, 'duration_sec', None) or int((getattr(t, 'length', 0) or 0) // 1000)
+            curr_dur = getattr(current_track, 'duration_sec', None) or int((getattr(current_track, 'length', 0) or 0) // 1000)
+            if dur > 0 and (dur < 45 or dur > 600) and curr_dur < 600:
+                return False
+            t_low = t.title.lower()
+            if any(bad in t_low for bad in ["1 hour", "10 hours", "nonstop", "full album", "podcast", "jukebox", "reaction", "shorts", "#shorts", "status"]):
+                return False
+            # Deduplication check using clean_title_for_comparison
+            curr_art = getattr(current_track, 'author', '') or ''
+            t_art = getattr(t, 'author', '') or ''
+            if is_similar_title(current_track.title, t.title, curr_art, t_art):
+                return False
+            for past_title in excluded_titles:
+                if is_similar_title(past_title, t.title, '', t_art):
+                    return False
+            return True
 
-                    author=chosen['author'],
+        # Phase A: Try recommendation queries in batches of 2
+        for i in range(0, min(len(search_queries), 8), 2):
+            batch = search_queries[i:i + 2]
+            tasks = [self.search_track(q, requester) for q in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Track) and is_valid_candidate(res):
+                    if player:
+                        player.played_uris.add(res.uri)
+                        player.played_titles.add(res.title)
+                    print(f"[Autoplay] Selected track: '{res.title}' by '{res.author}'", flush=True)
+                    return res
 
-                    duration_sec=chosen['duration'],
+        # Phase B: If recommendations didn't yield a track, try fallback queries
+        if fallback_queries:
+            tasks = [self.search_track(q, requester) for q in fallback_queries[:3]]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Track) and is_valid_candidate(res):
+                    if player:
+                        player.played_uris.add(res.uri)
+                        player.played_titles.add(res.title)
+                    print(f"[Autoplay] Selected fallback track: '{res.title}' by '{res.author}'", flush=True)
+                    return res
 
-                    stream_url=chosen['url'],
-
-                    requester=requester,
-
-                    thumbnail=chosen['thumbnail']
-
-                )
-
-                if player:
-
-                    player.played_uris.add(track.uri)
-
-                    norm_t = re.sub(r'[^a-zA-Z0-9]', '', track.title.lower())
-
-                    if norm_t:
-
-                        player.played_titles.add(norm_t)
-
-                return track
-
-        except Exception as e:
-
-            print(f"Error in YouTube autoplay: {e}")
-
-
+        print(f"[Autoplay] No suitable track found for queries from '{raw_title}'", flush=True)
         return None
 
 
@@ -9250,6 +9246,9 @@ class MusicCog(commands.Cog, name="Music"):
 
             return
 
+        player.session_mood = None
+        player.session_genre = None
+
 
         # Check if query is any Spotify link or URI
 
@@ -9675,6 +9674,9 @@ class MusicCog(commands.Cog, name="Music"):
 
 
         skipped_track = player.current
+        player.skip_requested = True
+        if player.loop_mode == "track":
+            player.loop_mode = "off"
 
         next_track = player.queue[0] if player.queue else (player.prefetched_autoplay if player.autoplay else None)
 
@@ -10761,41 +10763,6 @@ class MusicCog(commands.Cog, name="Music"):
             await ctx.send(embed=embed)
 
 
-    @commands.command(name="voicecmd", aliases=["vcmd", "voice", "voicecommand", "listen"])
-    async def voicecmd_command(self, ctx: commands.Context, *, command_text: Optional[str] = None):
-        """Executes a voice command from text or attached Discord voice note."""
-        target_text = command_text
-        if ctx.message.attachments:
-            att = ctx.message.attachments[0]
-            try:
-                audio_bytes = await att.read()
-                from bot import transcribe_discord_audio
-                target_text = await transcribe_discord_audio(audio_bytes)
-            except Exception as e:
-                return await ctx.send(embed=discord.Embed(description=f"{E_CROSS} Error processing voice message: `{e}`", color=discord.Color.red()))
-
-        if not target_text or not target_text.strip():
-            return await ctx.send(embed=discord.Embed(
-                title=f"{E_MIC} Nayumi Voice Commands",
-                description=(
-                    f">>> **How to use Voice Commands in Discord:**\n\n"
-                    f"**Method 1: Send a Discord Voice Note 🎙️**\n"
-                    f"Chat me mic button hold karke voice message bhejo (e.g. *\"Nayumi gaana chalao kesariya\"*, *\"Pause\"*, *\"Volume 80\"*).\n\n"
-                    f"**Method 2: Run `{ctx.prefix}voicecmd <command>` 💬**\n"
-                    f"• `{ctx.prefix}voicecmd gaana chalao kesariya`\n"
-                    f"• `{ctx.prefix}voicecmd pause`\n"
-                    f"• `{ctx.prefix}voicecmd resume`\n"
-                    f"• `{ctx.prefix}voicecmd skip`\n"
-                    f"• `{ctx.prefix}voicecmd volume 80`\n"
-                    f"• `{ctx.prefix}voicecmd autoplay on`\n"
-                    f"• `{ctx.prefix}voicecmd leave`\n\n"
-                    f"✨ **Supported Languages:** Hindi, Hinglish, & English!"
-                ),
-                color=discord.Color.from_rgb(255, 105, 180)
-            ))
-
-        await self.handle_voice_command(ctx.guild, ctx.author, target_text, target_channel=ctx.channel)
-
     @commands.command(name="leave", aliases=["disconnect", "dc"])
     async def leave_cmd(self, ctx: commands.Context):
         """Disconnects the bot from the voice channel."""
@@ -11018,8 +10985,20 @@ class MusicCog(commands.Cog, name="Music"):
         """Toggles smart autoplay recommendations."""
 
         player = self.get_player(ctx.guild)
-
         player.autoplay = not player.autoplay
+
+        if player.autoplay:
+            # When autoplay is enabled, track loop must be disabled so new songs stream automatically
+            if player.loop_mode == "track":
+                player.loop_mode = "off"
+            # Trigger prefetch immediately if nothing in queue
+            if player.current and len(player.queue) == 0:
+                if player.prefetch_task and not player.prefetch_task.done():
+                    player.prefetch_task.cancel()
+                player.prefetch_task = self.bot.loop.create_task(player.prefetch_autoplay())
+
+        if player.last_np_msg:
+            self.bot.loop.create_task(self.update_nowplaying_card(player.last_np_msg.channel.id, player.last_np_msg.id, player))
 
         status_str = "Enabled" if player.autoplay else "Disabled"
 
@@ -11058,6 +11037,115 @@ class MusicCog(commands.Cog, name="Music"):
         if player.autoplay and player.is_playing and not player.prefetched_autoplay:
 
             player.bot.loop.create_task(player.prefetch_autoplay())
+
+
+    @commands.command(name="artistradio", aliases=["ar", "radio_station"])
+    async def artistradio_cmd(self, ctx: commands.Context, *, artist_name: Optional[str] = None):
+        """Starts a dynamic radio station based on similar artists and top tracks from Last.fm (ported from Groove-Music)."""
+        if not artist_name:
+            player = self.get_player(ctx.guild)
+            if player.current:
+                artist_name = clean_track_author(player.current.author) or player.current.title
+            else:
+                return await ctx.send(embed=discord.Embed(
+                    description=f"{E_ALERT} **Please provide an artist name!**\nExample: `{ctx.prefix}artistradio Imagine Dragons` or `{ctx.prefix}ar Arijit Singh`",
+                    color=ANKUSH_COLOR
+                ))
+
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            return await ctx.send(embed=discord.Embed(
+                description=f"{E_ALERT} **You must be in a voice channel to start an artist radio!**",
+                color=ANKUSH_COLOR
+            ))
+
+        status_msg = await ctx.send(embed=discord.Embed(
+            description=f"{E_RECORDSPIN} **Starting Artist Radio for `{artist_name}`...**\n*Fetching similar artists & top tracks from Last.fm...*",
+            color=ANKUSH_COLOR
+        ))
+
+        # 1. Search artist to get canonical name
+        search_res = await lastfm_client.search_artist(artist_name)
+        canonical_artist = search_res.get("name") if (search_res and search_res.get("name")) else artist_name
+
+        # 2. Get top tracks of target artist & similar artists
+        original_tracks = await lastfm_client.get_top_tracks(canonical_artist, limit=5)
+        similar_artists = await lastfm_client.get_similar_artists(canonical_artist, limit=6)
+
+        similar_tracks: List[Dict[str, str]] = []
+        for sim_a in similar_artists[:4]:
+            t_list = await lastfm_client.get_top_tracks(sim_a, limit=2)
+            similar_tracks.extend(t_list)
+
+        random.shuffle(similar_tracks)
+
+        candidate_queries = []
+        # Add 2 tracks from target artist
+        for t in original_tracks[:2]:
+            candidate_queries.append(f"{t['author']} {t['title']}")
+        # Add 3 tracks from similar artists
+        for t in similar_tracks[:3]:
+            candidate_queries.append(f"{t['author']} {t['title']}")
+
+        if not candidate_queries:
+            # Fallback to artist search
+            candidate_queries = [
+                f"{canonical_artist} top hit song",
+                f"{canonical_artist} popular song",
+                f"{canonical_artist} latest track"
+            ]
+
+        # Connect voice channel
+        vc = await self.connect_voice_channel(ctx.author.voice.channel)
+        if not vc:
+            return await status_msg.edit(embed=discord.Embed(
+                description=f"{E_CROSS} **Failed to connect to your voice channel.**",
+                color=ANKUSH_COLOR
+            ))
+
+        player = self.get_player(ctx.guild)
+        player.home_channel = ctx.channel
+
+        queued_count = 0
+        first_track = None
+        for q in candidate_queries:
+            resolved = await self.search_track(q, ctx.author)
+            if resolved:
+                if not player.current and queued_count == 0:
+                    first_track = resolved
+                else:
+                    player.queue.append(resolved)
+                queued_count += 1
+                if queued_count >= 5:
+                    break
+
+        if queued_count == 0:
+            return await status_msg.edit(embed=discord.Embed(
+                description=f"{E_CROSS} **Could not resolve playable tracks for `{canonical_artist}`.**",
+                color=ANKUSH_COLOR
+            ))
+
+        # Enable autoplay automatically (just like Groove-Music)
+        player.autoplay = True
+        if player.loop_mode == "track":
+            player.loop_mode = "off"
+
+        sim_display = ", ".join(similar_artists[:3]) if similar_artists else "related artists"
+        embed = discord.Embed(
+            title=f"{E_RECORDSPIN} Artist Radio Started: {canonical_artist}",
+            description=(
+                f">>> {E_TICK} **Queued {queued_count} tracks** from **{canonical_artist}** and {sim_display}.\n"
+                f"{E_AUTOPLAY} **Autoplay Enabled:** Continuous music streaming in this vibe.\n\n"
+                f"{E_USER} **Started by:** {ctx.author.mention}"
+            ),
+            color=ANKUSH_COLOR
+        )
+        embed.set_footer(text="Powered by Last.fm & Nayumi Audio Engine")
+        await status_msg.edit(embed=embed)
+
+        if first_track:
+            await player.play_track(first_track)
+        elif not player.is_playing and player.queue:
+            await player.play_next()
 
 
     @commands.command(name="search")

@@ -53,5 +53,7 @@
             "phone": 1512862828783210576
         }
     },
-    "payment_proof_channels": {}
+    "payment_proof_channels": {
+        "1471557799522734246": 1471557800806060153
+    }
 }
