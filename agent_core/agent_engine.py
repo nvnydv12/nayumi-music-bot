@@ -1162,14 +1162,18 @@ class AgentEngine:
         clean_text = re.sub(r'\[(?:Nayumi\'s Reply to|Reply to|Nayumi to)[^\]]+\]:\s*', '', clean_text, flags=re.IGNORECASE)
         clean_text = re.sub(r'^\s*(?:\([^)]+\)|\*[^*]+\*)\s*', '', clean_text)
 
-        # Strip internal analysis / reasoning bullet preambles from models
+        # Strip internal analysis / reasoning bullet preambles and metadata leaks
+        clean_text = re.sub(r'^(?:Message:\s*["\'][^"\']+["\']\s*\*?\s*)+', '', clean_text, flags=re.IGNORECASE)
+        clean_text = re.sub(r'\*\s*(?:Relationship|Context|Directive|Language|Persona|Speaker|User|Constraint|Input|Mood):\s*[^*\r\n]+', '', clean_text, flags=re.IGNORECASE)
+        clean_text = re.sub(r'^(?:Message|Relationship|Context|Directive|Language|Persona|Speaker|User|Constraint|Input|Mood):\s*[^\r\n]*(?:\r?\n|$)', '', clean_text, flags=re.IGNORECASE | re.MULTILINE)
+
         lines = clean_text.splitlines()
         clean_lines = []
         in_analysis = True
         for l in lines:
             st = l.strip()
             if in_analysis:
-                if st.startswith(("•", "o ")) or re.match(r'^(?:[A-Z0-9_\s]+\s*\([^)]+\)\.?|"[^"]+"\s*\([^)]+\)\.?|Analysis:|Intent:|Context:|Persona:|Speaker:|Draft \d+:|Constraint:)', st, re.IGNORECASE):
+                if st.startswith(("•", "o ", "-")) or re.match(r'^(?:[A-Z0-9_\s]+\s*\([^)]+\)\.?|"[^"]+"\s*\([^)]+\)\.?|Message:|Analysis:|Intent:|Context:|Persona:|Speaker:|Draft \d+:|Constraint:|Directive:|Relationship:|Language:|Input:)', st, re.IGNORECASE):
                     continue
                 if not st:
                     continue

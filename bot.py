@@ -6293,11 +6293,9 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
     )
 
     if is_deep_request:
-        default_tokens = 1200
-    elif is_micro_request:
-        default_tokens = 90
+        default_tokens = 1500
     else:
-        default_tokens = 220
+        default_tokens = 650
 
     payload = {
         "contents": contents,
@@ -6370,15 +6368,21 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
                 if candidates and isinstance(candidates, list) and "content" in candidates[0]:
                     parts = candidates[0]["content"].get("parts", [])
                     if parts:
-                        # Extract non-thought dialogue parts first
+                        # Extract non-thought dialogue parts ONLY
                         real_parts = [p.get("text", "") for p in parts if not p.get("thought", False) and "text" in p]
                         if not real_parts:
-                            # If only thought parts, join text from parts
-                            real_parts = [p.get("text", "") for p in parts if "text" in p]
+                            # NEVER treat internal thought parts as dialogue speech!
+                            continue
 
                         answer = "".join(real_parts).strip()
                         answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip()
                         answer = re.sub(r'<thought>.*?</thought>', '', answer, flags=re.DOTALL).strip()
+                        
+                        # Strip metadata checklist / thought leak
+                        answer = re.sub(r'^(?:Message:\s*["\'][^"\']+["\']\s*\*?\s*)+', '', answer, flags=re.IGNORECASE)
+                        answer = re.sub(r'\*\s*(?:Relationship|Context|Directive|Language|Persona|Speaker|User|Constraint|Input|Mood):\s*[^*\r\n]+', '', answer, flags=re.IGNORECASE)
+                        answer = re.sub(r'^(?:Message|Relationship|Context|Directive|Language|Persona|Speaker|User|Constraint|Input|Mood):\s*[^\r\n]*(?:\r?\n|$)', '', answer, flags=re.IGNORECASE | re.MULTILINE)
+
                         answer = re.sub(r'\[(?:Nayumi\'s Reply to|Reply to|Nayumi to)[^\]]+\]:\s*', '', answer, flags=re.IGNORECASE).strip()
                         answer = re.sub(r'^(?:\[?Nayumi(?:\'s\s*reply)?\]?\s*:\s*)', '', answer, flags=re.IGNORECASE).strip()
                         answer = re.sub(r'\*(?:[a-zA-Z\s,]+)\*', '', answer).strip()
@@ -6392,7 +6396,7 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
                         for l in lines:
                             st = l.strip()
                             if in_analysis:
-                                if st.startswith(("*", "•", "o ", "-")) or re.match(r'^(?:[A-Z0-9_\s]+\s*\([^)]+\)\.?|"[^"]+"\s*\([^)]+\)\.?|Analysis:|Intent:|Context:|Persona:|Speaker:|Draft \d+:|Constraint:|User:|Language:|Meaning:|Literal translation:|Option \d+:|Determine System)', st, re.IGNORECASE):
+                                if st.startswith(("*", "•", "o ", "-")) or re.match(r'^(?:[A-Z0-9_\s]+\s*\([^)]+\)\.?|"[^"]+"\s*\([^)]+\)\.?|Message:|Analysis:|Intent:|Context:|Persona:|Speaker:|Draft \d+:|Constraint:|User:|Language:|Meaning:|Literal translation:|Option \d+:|Determine System|Relationship:|Directive:|Input:)', st, re.IGNORECASE):
                                     continue
                                 if not st:
                                     continue
@@ -6402,7 +6406,7 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
                         if clean_lines:
                             answer = "\n".join(clean_lines).strip()
 
-                        if answer and len(answer) > 0:
+                        if answer and len(answer) > 0 and not any(k in answer for k in ["* Relationship:", "* Directive:", "* Context:"]):
                             return 200, {"answer": answer}
 
             if status == 404:
@@ -12975,20 +12979,15 @@ async def on_message(message):
 
                     if is_micro_msg:
                         dynamic_sizing_directive = (
-                            f"⚡ [COGNITIVE BRAIN SIZING: TIER 1 - MICRO / 1-LINER DETECTED]\n"
-                            f"• User sent a short reaction, emoji, or quick teasing/banter ('{user_text}').\n"
-                            f"• EXACT LENGTH CONSTRAINT: Strictly 1 short, sweet, snappy, punchy line (under 12-15 words)! Do NOT write a paragraph or multi-line essay!"
+                            "• Length Constraint: User sent a short reaction/greeting. Keep your reply strictly to 1 short, sweet, snappy line (under 12-15 words)! Do NOT write paragraphs, notes, or meta-analysis."
                         )
                     elif is_deep_msg:
                         dynamic_sizing_directive = (
-                            f"📖 [COGNITIVE BRAIN SIZING: TIER 3 - DEEP / DETAILED QUERY DETECTED]\n"
-                            f"• User is asking a detailed, technical, emotional, or thoughtful question ('{user_text}').\n"
-                            f"• EXACT LENGTH CONSTRAINT: Provide a full, insightful, comprehensive, and well-structured response (with clean points/headers if needed) without cutting corners!"
+                            "• Length Constraint: User is asking a detailed, technical, emotional, or thoughtful question. Provide a full, comprehensive, and well-structured response without cutting corners!"
                         )
                     else:
                         dynamic_sizing_directive = (
-                            f"💬 [COGNITIVE BRAIN SIZING: TIER 2 - CASUAL EVERYDAY CHAT]\n"
-                            f"• Everyday conversation: Give a natural, charming, sweet 1 to 3 lines reply."
+                            "• Length Constraint: Casual everyday chat. Give a natural, charming, sweet 1 to 3 lines reply."
                         )
 
                     dynamic_system_prompt = (
@@ -12999,8 +12998,11 @@ async def on_message(message):
                         f"• If asked what time it is, what date today is, or what day it is, tell this EXACT live time/date accurately with zero hesitation!\n\n"
                         f"=== CURRENT DISCORD INTERACTION ===\n"
                         f"• YOU ARE CURRENTLY TALKING EXCLUSIVELY TO: **{message.author.display_name}** (User ID: {message.author.id})\n"
-                        f"• 🧠 COGNITIVE BRAIN & INTENT UNDERSTANDING:\n"
-                        f"  - Dimag lagao aur pehle baat ka context, emotion, aur matlab deeply samjho!\n"
+                        f"• 🧠 CONVERSATION COMPREHENSION & DIRECT DIALOGUE:\n"
+                        f"  - Understand their mood, emotion, and context naturally and reply directly with high EQ, warmth, and sweetness!\n"
+                        f"  - 🚫 ABSOLUTE PROHIBITION ON INTERNAL THOUGHTS & METADATA:\n"
+                        f"    * NEVER output thoughts, checklists, notes, or metadata like 'Message: ... * Relationship: ... * Context: ...'!\n"
+                        f"    * OUTPUT ONLY YOUR PURE DIRECT CONVERSATIONAL SPEECH TO {message.author.display_name.upper()}!\n"
                         f"  - Agar {message.author.display_name} mazaak/chhed raha hai toh witty mazaak me raho; agar emotional/upset hai toh dil se empathy do; agar advice/code maang raha hai toh high IQ solution do!\n"
                         f"  - Har reply bilkul sweet, pyaare, warm aur natural andaz me do!\n"
                         f"  - 🚫 ZERO NAME-CALLING SPAM: Do NOT start every reply by saying their name! In real texting, people rarely say names on every message. Just reply directly to what they said.\n"
@@ -13054,11 +13056,23 @@ async def on_message(message):
                         }
                         clean_reply, executed = await AgentEngine.process_response(raw_reply, agent_context)
                         clean_reply = resolve_discord_mentions(clean_reply, message.guild)
+                        clean_reply = re.sub(r'^(?:Message:\s*["\'][^"\']+["\']\s*\*?\s*)+', '', clean_reply, flags=re.IGNORECASE)
+                        clean_reply = re.sub(r'\*\s*(?:Relationship|Context|Directive|Language|Persona|Speaker|User|Constraint|Input|Mood):\s*[^*\r\n]+', '', clean_reply, flags=re.IGNORECASE)
+                        clean_reply = re.sub(r'^(?:Message|Relationship|Context|Directive|Language|Persona|Speaker|User|Constraint|Input|Mood):\s*[^\r\n]*(?:\r?\n|$)', '', clean_reply, flags=re.IGNORECASE | re.MULTILINE)
                         clean_reply = re.sub(r'\[(?:Nayumi\'s Reply to|Reply to|Nayumi to)[^\]]+\]:\s*', '', clean_reply, flags=re.IGNORECASE).strip()
                         clean_reply = re.sub(r'^(?:\[?Nayumi(?:\'s\s*reply)?\]?\s*:\s*)', '', clean_reply, flags=re.IGNORECASE).strip()
                         clean_reply = re.sub(r'\*(?:[a-zA-Z\s,]+)\*', '', clean_reply).strip()
                         clean_reply = re.sub(r'\((?:[a-zA-Z\s,]+(?:softly|giggles?|smiles?|laughs?|sighs?|winks?|blushes?|pouts?|looks?|teases?|whispers?|gasps?)[a-zA-Z\s,]*)\)', '', clean_reply, flags=re.IGNORECASE).strip()
+                        clean_reply = re.sub(r'^\s*[*•-]\s*', '', clean_reply, flags=re.MULTILINE)
                         clean_reply = re.sub(r'\s{2,}', ' ', clean_reply).strip()
+
+                        if not clean_reply or any(k in clean_reply for k in ["* Relationship:", "* Directive:", "* Context:"]):
+                            if is_bunny_speaking:
+                                clean_reply = random.choice(["Haanji Bunny! Bolo na 🌸", "Arey Bunny! Kaisa hai? ✨", "Sun rahi hoon Bunny! Batao 🎀", "Haanji Bunny bhai, sab badhiya? 🌸"])
+                            elif is_didi_speaking:
+                                clean_reply = random.choice(["Haanji Didi! Pranam 🌸 Kaise ho aap?", "Ji Didi, main sun rahi hoon! ✨", "Haanji Didi, bataiye na! 🎀"])
+                            else:
+                                clean_reply = random.choice(["Haanji! Kaise ho? 🌸", "Hello! Batao kya haal chaal? ✨", "Main sun rahi hoon! Bolo na 🎀"])
 
                         # Trim multi-paragraph essays for casual chat
                         low_u = user_text.lower() if user_text else ""
