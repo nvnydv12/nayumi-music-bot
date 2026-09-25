@@ -6175,23 +6175,20 @@ def run_free_ai_sync(contents, system_prompt=NAYUMI_SYSTEM_PROMPT):
 
 
 _gemini_key_index = 0
+_gemini_last_good_key = None
 _gemini_key_cooldowns = {}
 _gemini_model_cooldowns = {}
 _recent_fallback_replies = collections.deque(maxlen=40)
 _configured_model = os.getenv("GEMINI_MODEL", "gemma-4-26b-a4b-it").strip()
 AVAILABLE_GEMINI_MODELS = [
-    _configured_model,
     "gemma-4-26b-a4b-it",
+    _configured_model,
+    "gemini-3.8-flash",
     "gemini-3-flash-preview",
     "gemini-flash-latest",
     "gemini-3.5-flash-lite",
     "gemini-3.6-flash",
-    "gemini-3.7-flash",
-    "gemini-3.8-flash",
-    "gemini-pro-latest",
-    "gemini-3.1-pro-preview",
-    "gemini-flash-lite-latest",
-    "nano-banana-pro-preview"
+    "gemini-pro-latest"
 ]
 # Deduplicate preserving order
 AVAILABLE_GEMINI_MODELS = list(dict.fromkeys([m for m in AVAILABLE_GEMINI_MODELS if m]))
@@ -6262,7 +6259,7 @@ async def call_pollinations_backup_ai(contents: list, system_prompt: str = NAYUM
     return None
 
 async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMPT):
-    global _gemini_key_index, _gemini_key_cooldowns, _gemini_model_cooldowns, _recent_fallback_replies
+    global _gemini_key_index, _gemini_last_good_key, _gemini_key_cooldowns, _gemini_model_cooldowns, _recent_fallback_replies
     raw_keys = os.getenv("GEMINI_API_KEY", "").strip()
     keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
 
@@ -6296,17 +6293,17 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
     )
 
     if is_deep_request:
-        default_tokens = 1500
+        default_tokens = 1200
     elif is_micro_request:
-        default_tokens = 120
+        default_tokens = 90
     else:
-        default_tokens = 380
+        default_tokens = 220
 
     payload = {
         "contents": contents,
         "generationConfig": {
             "maxOutputTokens": default_tokens,
-            "temperature": 0.75
+            "temperature": 0.72
         },
         "safetySettings": [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -6322,12 +6319,15 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
         }
 
     headers = {"Content-Type": "application/json"}
-    timeout = aiohttp.ClientTimeout(total=12.0, connect=3.0)
+    timeout = aiohttp.ClientTimeout(total=4.5, connect=1.5)
     now = time.time()
     total_keys = len(keys)
 
-    # Continuously rotate starting key across requests for load balancing
-    _gemini_key_index = (_gemini_key_index + 1) % total_keys
+    # Order keys so known working key is tried first for near-instant 0.8s response
+    ordered_keys = list(keys)
+    if _gemini_last_good_key and _gemini_last_good_key in ordered_keys:
+        ordered_keys.remove(_gemini_last_good_key)
+        ordered_keys.insert(0, _gemini_last_good_key)
 
     session = get_shared_session()
     # Multi-Model x Multi-Key Tiered Cascade
@@ -6336,13 +6336,13 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
         if _gemini_model_cooldowns.get(model, 0) > now:
             continue
 
-        max_key_attempts = min(total_keys, 30)
+        max_key_attempts = min(total_keys, 15)
         model_404 = False
         consecutive_429s = 0
 
         for attempt in range(max_key_attempts):
             idx = (_gemini_key_index + attempt) % total_keys
-            current_key = keys[idx]
+            current_key = ordered_keys[idx]
             cooldown_key = f"{model}_{current_key}"
 
             # Short cooldown for rate-limited key on this specific model
@@ -6364,6 +6364,7 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
                 data = {"raw_response": text}
 
             if status == 200:
+                _gemini_last_good_key = current_key
                 _gemini_key_index = (idx + 1) % total_keys
                 candidates = data.get("candidates", [])
                 if candidates and isinstance(candidates, list) and "content" in candidates[0]:
@@ -6409,10 +6410,15 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
                 break
 
             if status == 429:
-                _gemini_key_cooldowns[cooldown_key] = now + 45
+                _gemini_key_cooldowns[cooldown_key] = now + 300
                 consecutive_429s += 1
-                # If 12 different keys all returned 429 on this model, cool down the model and cascade to next model
-                if consecutive_429s >= min(total_keys, 12):
+                err_text = text.lower()
+                # Fast failover if model quota exhausted
+                if "quota" in err_text or "exceeded" in err_text:
+                    if consecutive_429s >= 2:
+                        _gemini_model_cooldowns[model] = now + 300
+                        break
+                elif consecutive_429s >= 4:
                     _gemini_model_cooldowns[model] = now + 60
                     break
                 continue
@@ -12784,103 +12790,107 @@ async def on_message(message):
                             f"NEVER hallucinate or invent dummy placeholder keys like 'AIzaSyDummyKey...'! Give the actual 100% real strings.\n"
                         )
 
-                    autonomous_tools_section = (
-                        f"\n\n{AgentEngine.get_tool_schema_for_prompt()}\n\n"
-                        "=== CRITICAL ACTION ROUTING DIRECTIVES ===\n"
-                        "1. TAGGING A USER: When asked to tag/mention someone (e.g. 'vivek ko tag karo', 'suyash ko 5bar tag karo'):\n"
-                        "   • For multi-tagging (e.g. '5 baar tag karo', '3 baar tag kar'): ALWAYS use `[ACTION:tag_user(target_user=\"vivek\", count=5)]` so it sends multiple separate ping messages!\n"
-                        "   • For a normal single tag (e.g. 'vivek ko tag karo', 'bunny ko bulao'): Tag them directly inside your single natural message using `<@USER_ID>`!\n"
-                        "2. SENDING A PERSONAL DM: When asked to DM or private message a single individual (e.g. 'suyash ko DM kar do...', 'surjit ko message send kro...', 'X ko DM bhejo'):\n"
-                        "   • ALWAYS prepend `[ACTION:send_dm(target_user=\"target_name_or_id\", message_content=\"...\")]` at the start of your message! (Includes private reply tip relay for 1-on-1 chats)\n"
-                        "   • MANDATORY OBEDIENCE: Whenever an Admin or Whitelisted Operator tells you to DM someone, YOU MUST OBEY 100% AND TRIGGER `[ACTION:send_dm(...)]` IMMEDIATELY!\n"
-                        "3. POSTING TO A CHANNEL / SERVER / ANNOUNCEMENTS / FEEDBACK: When asked to send a message to a channel name, ID, or server (e.g. 'feedback channel me daal do...', 'announcement karo...'):\n"
-                        "   • ALWAYS use `[ACTION:send_channel_message(channel=\"<channel_id_or_name>\", message_content=\"...\")]`!\n"
-                        "   • TARGETING SPECIFIC SERVERS: If the user names a specific server (e.g. 'SS EMPIRE', 'Free Fire'), include `server_name=\"<server_name_or_id>\"`!\n"
-                        "   • ZERO HARDCODED DUMMY IDS: Pick the REAL Channel ID or name directly from the LIVE DISCORD SERVERS & CHANNELS DIRECTORY below!\n"
-                        "   • STRICT PRIVACY - ZERO UNREQUESTED NAME DROPPING: NEVER mention or inject Bunny's name (e.g. do NOT write 'Powered by Bunny' or 'Tested by Bunny') in public announcements or feedback posts UNLESS Bunny explicitly orders you to include his name! Focus purely on the content/panel.\n"
-                        "   • BEAUTIFUL & CLEAN FORMATTING: Structure announcements with clear bold headers, clean dividers (`━━━━━━━━━━━━━━━━━━━━━━━━━━━━`), bullet points, and aesthetic custom + standard emojis so it looks extremely premium and complete!\n"
-                        "   • ALL CUSTOM DISCORD EMOJIS AVAILABLE TO USE IN ANNOUNCEMENTS & MESSAGES:\n"
-                        "       - Crowns & Diamond: `<a:blackcrown:1543148226100600922>`, `<a:crown:1543148555500392501>`, `<a:diamond:1545473841315319891>`\n"
-                        "       - Nitro Booster & Fire: `<a:booster:1543148240432660500>`, `<:fire:1543148203526856704>`\n"
-                        "       - Arrows & Details: `<a:arrow:1543148228558721024>`, `<:details:1543148197390712913>`\n"
-                        "       - Verification & Status: `<:tick:1543148221264826418>`, `<:cross:1543148199273828432>`, `<:warning:1543148211328520242>`, `<a:loading:1543148214050619402>`\n"
-                        "       - System & Security: `<a:gear:1543148201547268156>`, `<:security:1543148219217879060>`, `<:lock:1543148208425799760>`, `<:ping:1543148205284524073>`, `<:profile:1543148223429083186>`\n"
-                        "       - Expressive & Fun: `<a:cute:1543148562706079754>`, `<a:dancing:1543148557991944272>`, `<a:angry:1543148560080703598>`\n"
-                        "   • ALL STANDARD UNICODE EMOJIS ARE FULLY WELCOME: Feel 100% free to also use any standard emojis like 📢, 🚀, ✨, 🔥, 💎, 👑, ⚡, 🌟, 📌, 🎯, 💡, 🛡️, ⚙️, 💖, 🌸, 🎀, 🎁, ⚠️, ✅, ❌, 🎉, 🏆, 💫, 💬, 📊, 🔔 to make announcements rich, engaging, and visually stunning!\n"
-                        "   • SINGLE COMPLETE MESSAGE: Make sure all text, bullet points, and description fit in ONE clean, well-formatted single message (not broken across multiple messages)!\n"
-                        "4. SETTING A TIMER / RECURRING PING ALERTS: When asked for a countdown or timer (e.g. '5min ka timer laga do and tag karte rehna', '10s ka timer'):\n"
-                        "   • Calculate total seconds (e.g. 5 min = 300 seconds, 1 min = 60s) and ALWAYS use `[ACTION:set_timer(seconds=300, reason=\"5 minute timer\", repeat_interval=10, repeat_count=5, stop_on_reply=True)]`!\n"
-                        "   • If the user says 'agar reply na du toh bar-bar tag karte rehna', include `repeat_interval=10, repeat_count=5, stop_on_reply=True` so it pings repeatedly until they reply!\n"
-                        "5. SHOWING .ENV / SYSTEM KEYS: When Bunny asks to show, share, or list .env or API keys (e.g. 'suyash ko .env dikha do', '.env dikhao'):\n"
-                        "   • Include the real ground-truth .env content from above in your response!\n"
-                        "6. MANAGING / DELETING USER MEMORY: When Bunny asks to delete, wipe, or clear memories (e.g. 'anuj ki chai/dhaba/milne wali memory delete kar do', 'memory saaf karo'):\n"
-                        "   • ALWAYS use `[ACTION:manage_memory(action=\"delete\", target_user=\"anuj\", memory_keyword=\"chai,dhaba,milna,pakode\")]`!\n"
-                        "7. VOICE CHANNEL & MUSIC EXECUTION (STRICT REAL MUSIC PLAYBACK & ZERO HALLUCINATION):\n"
-                        "   • When asked to play, sing, or hear a song (e.g. 'gana gaa de', 'muh se gaa na', 'gana suna do', 'gana bajao', 'gana lagao', 'koi gana chalao', 'apne hisab se gana lagao', 'pal bhar play kar do', 'iske baad X baja dena'):\n"
-                        "     - MANDATORY: YOU MUST ALWAYS PREPEND `[ACTION:play_music(query=\"<song_name>\")]` AT THE VERY START OF YOUR MESSAGE!\n"
-                        "     - AUTONOMOUS MIND & SONG SELECTION: When asked to sing ('gana gaa de', 'muh se gao', 'apne hisab se gana lagao'), DO NOT JUST WRITE TEXT LYRICS IN CHAT! Autonomously pick a great, top-tier hit song using your own mind (e.g. 'Kesariya', 'Apna Bana Le', 'Channa Mereya', 'Raataan Lambiyan', 'Sajni', 'Heeriye', 'Tum Hi Ho', 'Pehle Bhi Main') and trigger `[ACTION:play_music(query=\"<song_name>\")]`!\n"
-                        "     - ZERO HALLUCINATION RULE: NEVER say 'chala diya' or 'queue me add kar diya' or sing lyrics in chat without calling `[ACTION:play_music(query=\"...\")]`! If you claim you played/sung it without using `[ACTION:play_music]`, the real player will never play it!\n"
-                        "     - Clean song query: Extract just the pure song title.\n"
-                        "   • To join voice channel: ALWAYS use `[ACTION:join_vc()]`!\n"
-                        "   • To leave voice channel: ALWAYS use `[ACTION:leave_vc()]`!\n"
-                        "   • To pause/resume/skip/stop/loop music: ALWAYS use `[ACTION:control_music(action=\"<pause|resume|skip|stop|queue|loop>\")]`!\n\n"
-                        "CRITICAL: Always prepend the exact [ACTION:tool_name(...)] tag at the beginning of your response so the backend executes it instantly in real life!\n"
-                    )
+                    user_low = user_text.lower() if user_text else ""
+                    action_keywords = [
+                        "gana", "gaana", "song", "play", "music", "bajao", "suno", "suna", "chalao", "sing",
+                        "dm", "pm", "message", "msg", "bhejo", "send", "tag", "ping", "mention", "bulao",
+                        "timer", "countdown", "remind", "channel", "server", "announc", "post", "feedback",
+                        "memory", "clear", "delete", "join", "leave", "vc", "voice", "stop", "pause", "skip", "resume", "loop", "queue"
+                    ]
+                    has_action_intent = any(k in user_low for k in action_keywords)
+                    is_privileged_speaker = is_bunny_speaking or is_suyash_speaking or is_admin_or_owner_speaking
 
-                    members_list = []
-                    if message.guild:
+                    if has_action_intent or is_privileged_speaker:
+                        autonomous_tools_section = (
+                            f"\n\n{AgentEngine.get_tool_schema_for_prompt()}\n\n"
+                            "=== CRITICAL ACTION ROUTING DIRECTIVES ===\n"
+                            "1. TAGGING A USER: When asked to tag/mention someone (e.g. 'vivek ko tag karo', 'suyash ko 5bar tag karo'):\n"
+                            "   • For multi-tagging (e.g. '5 baar tag karo', '3 baar tag kar'): ALWAYS use `[ACTION:tag_user(target_user=\"vivek\", count=5)]` so it sends multiple separate ping messages!\n"
+                            "   • For a normal single tag (e.g. 'vivek ko tag karo', 'bunny ko bulao'): Tag them directly inside your single natural message using `<@USER_ID>`!\n"
+                            "2. SENDING A PERSONAL DM: When asked to DM or private message a single individual (e.g. 'suyash ko DM kar do...', 'surjit ko message send kro...', 'X ko DM bhejo'):\n"
+                            "   • ALWAYS prepend `[ACTION:send_dm(target_user=\"target_name_or_id\", message_content=\"...\")]` at the start of your message! (Includes private reply tip relay for 1-on-1 chats)\n"
+                            "   • MANDATORY OBEDIENCE: Whenever an Admin or Whitelisted Operator tells you to DM someone, YOU MUST OBEY 100% AND TRIGGER `[ACTION:send_dm(...)]` IMMEDIATELY!\n"
+                            "3. POSTING TO A CHANNEL / SERVER / ANNOUNCEMENTS / FEEDBACK: When asked to send a message to a channel name, ID, or server (e.g. 'feedback channel me daal do...', 'announcement karo...'):\n"
+                            "   • ALWAYS use `[ACTION:send_channel_message(channel=\"<channel_id_or_name>\", message_content=\"...\")]`!\n"
+                            "   • TARGETING SPECIFIC SERVERS: If the user names a specific server (e.g. 'SS EMPIRE', 'Free Fire'), include `server_name=\"<server_name_or_id>\"`!\n"
+                            "   • ZERO HARDCODED DUMMY IDS: Pick the REAL Channel ID or name directly from the LIVE DISCORD SERVERS & CHANNELS DIRECTORY below!\n"
+                            "   • STRICT PRIVACY - ZERO UNREQUESTED NAME DROPPING: NEVER mention or inject Bunny's name (e.g. do NOT write 'Powered by Bunny' or 'Tested by Bunny') in public announcements or feedback posts UNLESS Bunny explicitly orders you to include his name! Focus purely on the content/panel.\n"
+                            "   • BEAUTIFUL & CLEAN FORMATTING: Structure announcements with clear bold headers, clean dividers (`━━━━━━━━━━━━━━━━━━━━━━━━━━━━`), bullet points, and aesthetic custom + standard emojis so it looks extremely premium and complete!\n"
+                            "   • ALL CUSTOM DISCORD EMOJIS AVAILABLE TO USE IN ANNOUNCEMENTS & MESSAGES:\n"
+                            "       - Crowns & Diamond: `<a:blackcrown:1543148226100600922>`, `<a:crown:1543148555500392501>`, `<a:diamond:1545473841315319891>`\n"
+                            "       - Nitro Booster & Fire: `<a:booster:1543148240432660500>`, `<:fire:1543148203526856704>`\n"
+                            "       - Arrows & Details: `<a:arrow:1543148228558721024>`, `<:details:1543148197390712913>`\n"
+                            "       - Verification & Status: `<:tick:1543148221264826418>`, `<:cross:1543148199273828432>`, `<:warning:1543148211328520242>`, `<a:loading:1543148214050619402>`\n"
+                            "       - System & Security: `<a:gear:1543148201547268156>`, `<:security:1543148219217879060>`, `<:lock:1543148208425799760>`, `<:ping:1543148205284524073>`, `<:profile:1543148223429083186>`\n"
+                            "       - Expressive & Fun: `<a:cute:1543148562706079754>`, `<a:dancing:1543148557991944272>`, `<a:angry:1543148560080703598>`\n"
+                            "   • ALL STANDARD UNICODE EMOJIS ARE FULLY WELCOME: Feel 100% free to also use any standard emojis like 📢, 🚀, ✨, 🔥, 💎, 👑, ⚡, 🌟, 📌, 🎯, 💡, 🛡️, ⚙️, 💖, 🌸, 🎀, 🎁, ⚠️, ✅, ❌, 🎉, 🏆, 💫, 💬, 📊, 🔔 to make announcements rich, engaging, and visually stunning!\n"
+                            "   • SINGLE COMPLETE MESSAGE: Make sure all text, bullet points, and description fit in ONE clean, well-formatted single message (not broken across multiple messages)!\n"
+                            "4. SETTING A TIMER / RECURRING PING ALERTS: When asked for a countdown or timer (e.g. '5min ka timer laga do and tag karte rehna', '10s ka timer'):\n"
+                            "   • Calculate total seconds (e.g. 5 min = 300 seconds, 1 min = 60s) and ALWAYS use `[ACTION:set_timer(seconds=300, reason=\"5 minute timer\", repeat_interval=10, repeat_count=5, stop_on_reply=True)]`!\n"
+                            "   • If the user says 'agar reply na du toh bar-bar tag karte rehna', include `repeat_interval=10, repeat_count=5, stop_on_reply=True` so it pings repeatedly until they reply!\n"
+                            "5. SHOWING .ENV / SYSTEM KEYS: When Bunny asks to show, share, or list .env or API keys (e.g. 'suyash ko .env dikha do', '.env dikhao'):\n"
+                            "   • Include the real ground-truth .env content from above in your response!\n"
+                            "6. MANAGING / DELETING USER MEMORY: When Bunny asks to delete, wipe, or clear memories (e.g. 'anuj ki chai/dhaba/milne wali memory delete kar do', 'memory saaf karo'):\n"
+                            "   • ALWAYS use `[ACTION:manage_memory(action=\"delete\", target_user=\"anuj\", memory_keyword=\"chai,dhaba,milna,pakode\")]`!\n"
+                            "7. VOICE CHANNEL & MUSIC EXECUTION (STRICT REAL MUSIC PLAYBACK & ZERO HALLUCINATION):\n"
+                            "   • When asked to play, sing, or hear a song (e.g. 'gana gaa de', 'muh se gaa na', 'gana suna do', 'gana bajao', 'gana lagao', 'koi gana chalao', 'apne hisab se gana lagao', 'pal bhar play kar do', 'iske baad X baja dena'):\n"
+                            "     - MANDATORY: YOU MUST ALWAYS PREPEND `[ACTION:play_music(query=\"<song_name>\")]` AT THE VERY START OF YOUR MESSAGE!\n"
+                            "     - AUTONOMOUS MIND & SONG SELECTION: When asked to sing ('gana gaa de', 'muh se gao', 'apne hisab se gana lagao'), DO NOT JUST WRITE TEXT LYRICS IN CHAT! Autonomously pick a great, top-tier hit song using your own mind (e.g. 'Kesariya', 'Apna Bana Le', 'Channa Mereya', 'Raataan Lambiyan', 'Sajni', 'Heeriye', 'Tum Hi Ho', 'Pehle Bhi Main') and trigger `[ACTION:play_music(query=\"<song_name>\")]`!\n"
+                            "     - ZERO HALLUCINATION RULE: NEVER say 'chala diya' or 'queue me add kar diya' or sing lyrics in chat without calling `[ACTION:play_music(query=\"...\")]`! If you claim you played/sung it without using `[ACTION:play_music]`, the real player will never play it!\n"
+                            "     - Clean song query: Extract just the pure song title.\n"
+                            "   • To join voice channel: ALWAYS use `[ACTION:join_vc()]`!\n"
+                            "   • To leave voice channel: ALWAYS use `[ACTION:leave_vc()]`!\n"
+                            "   • To pause/resume/skip/stop/loop music: ALWAYS use `[ACTION:control_music(action=\"<pause|resume|skip|stop|queue|loop>\")]`!\n\n"
+                            "CRITICAL: Always prepend the exact [ACTION:tool_name(...)] tag at the beginning of your response so the backend executes it instantly in real life!\n"
+                        )
+                    else:
+                        autonomous_tools_section = (
+                            "\n• ACTION DIRECTIVE: If asked to sing or play a song in voice channel, prepend `[ACTION:play_music(query=\"<song_name>\")]` at the start of your reply!\n"
+                        )
+
+                    needs_tagging = any(k in user_low for k in ["tag", "ping", "bulao", "mention", "kaun hai", "who is", "members", "id", "kisko", "bulana"])
+                    if needs_tagging and message.guild:
+                        members_list = []
                         for m in message.guild.members:
                             if not m.bot:
                                 members_list.append(f"• {m.display_name} (Username: {m.name}): <@{m.id}>")
-                    members_dir = "\n".join(members_list[:40]) if members_list else "None cached"
-
-                    guild_members_section = (
-                        f"\n\n=== REAL DISCORD SERVER MEMBERS & MENTION TAGS ===\n"
-                        f"{members_dir}\n"
-                        f"• CRITICAL DIRECTIVE FOR DISCORD TAGS: When asked to tag, ping, or call someone (e.g. 'vivek ko tag karo', 'bunny ko bulao', 'suyash ko tag kar'), "
-                        f"ALWAYS use their EXACT real Discord mention ID `<@USER_ID>` (e.g. `<@1234567890>`)! NEVER just write plain text `@Name`! Use the `<@USER_ID>` so they get an actual Discord notification!\n"
-                    )
-
-                    # Build live real-time server and channels context
-                    server_context_lines = []
-                    if message.guild:
-                        curr_g = message.guild
-                        server_context_lines.append(f"🏰 **ACTIVE CURRENT SERVER:** {curr_g.name} (Server ID: `{curr_g.id}`)")
-                        server_context_lines.append(f"📌 **ACTIVE CURRENT CHANNEL:** #{message.channel.name} (Channel ID: `{message.channel.id}`)")
-
-                        sendable_chs = []
-                        if hasattr(curr_g, "channels"):
-                            sendable_chs = [c for c in curr_g.channels if hasattr(c, "send") and not isinstance(c, (discord.CategoryChannel, discord.VoiceChannel))]
-
-                        annc_chs = [c for c in sendable_chs if any(k in c.name.lower() for k in ["announc", "annc", "news", "update", "notice", "broadcast"])]
-                        other_chs = [c for c in sendable_chs if c not in annc_chs]
-
-                        server_context_lines.append("📢 **Announcements / News Channels in this current server:**")
-                        if annc_chs:
-                            for c in annc_chs[:6]:
-                                server_context_lines.append(f"  • #{c.name} (Channel ID: `{c.id}`)")
-                        else:
-                            server_context_lines.append("  • (No channels named 'announcement'. You can use any channel ID/name from below)")
-
-                        server_context_lines.append("📋 **Other Text Channels in this server:**")
-                        for c in other_chs[:15]:
-                            server_context_lines.append(f"  • #{c.name} (Channel ID: `{c.id}`)")
+                        members_dir = "\n".join(members_list[:35]) if members_list else "None cached"
+                        guild_members_section = (
+                            f"\n\n=== REAL DISCORD SERVER MEMBERS & MENTION TAGS ===\n"
+                            f"{members_dir}\n"
+                            f"• CRITICAL DIRECTIVE FOR DISCORD TAGS: When asked to tag, ping, or call someone, "
+                            f"ALWAYS use their EXACT real Discord mention ID `<@USER_ID>`! NEVER just write plain text `@Name`!\n"
+                        )
                     else:
-                        server_context_lines.append("📬 **DIRECT MESSAGE (DM) CONVERSATION (No Active Server)**")
+                        guild_members_section = ""
 
-                    if bot.guilds:
-                        server_context_lines.append("\n🌐 **ALL CONNECTED DISCORD SERVERS (OVERVIEW):**")
-                        for g in bot.guilds:
-                            is_curr = " *(CURRENT)*" if message.guild and g.id == message.guild.id else ""
-                            g_anncs = [f"#{c.name} (`{c.id}`)" for c in g.channels if hasattr(c, "send") and any(k in c.name.lower() for k in ["announc", "annc", "news", "update"])][:2]
-                            annc_str = f" | Annc: {', '.join(g_anncs)}" if g_anncs else ""
-                            server_context_lines.append(f"• **{g.name}** (Server ID: `{g.id}`){is_curr}{annc_str}")
-
-                    live_server_directory = (
-                        f"\n\n=== LIVE DISCORD SERVERS & CHANNELS DIRECTORY ===\n"
-                        f"{chr(10).join(server_context_lines)}\n"
-                        f"• CRITICAL DIRECTIVE: When asked to post an announcement or message to a server/channel, always pick the REAL Channel ID and/or Server Name from this directory! Never invent dummy IDs.\n"
-                    )
+                    needs_channels = any(k in user_low for k in ["channel", "server", "announc", "feedback", "post", "bhejo", "daalo", "broadcast", "notice", "news", "room", "tc"])
+                    if needs_channels:
+                        server_context_lines = []
+                        if message.guild:
+                            curr_g = message.guild
+                            server_context_lines.append(f"Active Server: {curr_g.name} (ID: `{curr_g.id}`), Channel: #{message.channel.name} (ID: `{message.channel.id}`)")
+                            sendable_chs = [c for c in curr_g.channels if hasattr(c, "send") and not isinstance(c, (discord.CategoryChannel, discord.VoiceChannel))]
+                            annc_chs = [c for c in sendable_chs if any(k in c.name.lower() for k in ["announc", "annc", "news", "update", "notice", "broadcast"])]
+                            other_chs = [c for c in sendable_chs if c not in annc_chs]
+                            if annc_chs:
+                                server_context_lines.append("Announcements Channels: " + ", ".join([f"#{c.name} (`{c.id}`)" for c in annc_chs[:5]]))
+                            if other_chs:
+                                server_context_lines.append("Other Text Channels: " + ", ".join([f"#{c.name} (`{c.id}`)" for c in other_chs[:10]]))
+                        else:
+                            server_context_lines.append("Direct Message (DM) Conversation")
+                        if bot.guilds:
+                            g_summaries = []
+                            for g in bot.guilds[:8]:
+                                g_summaries.append(f"{g.name} (`{g.id}`)")
+                            server_context_lines.append("Connected Servers: " + ", ".join(g_summaries))
+                        live_server_directory = (
+                            f"\n\n=== LIVE DISCORD SERVERS & CHANNELS DIRECTORY ===\n"
+                            f"{chr(10).join(server_context_lines)}\n"
+                            f"• CRITICAL DIRECTIVE: When asked to post an announcement or message to a server/channel, always pick the REAL Channel ID and/or Server Name from this directory! Never invent dummy IDs.\n"
+                        )
+                    else:
+                        live_server_directory = ""
 
                     disrespect_alert_section = ""
                     # Genuine toxic words and slurs directed to abuse/insult
@@ -12899,7 +12909,6 @@ async def on_message(message):
                         "madarchod bot", "chod dunga", "chud gaya"
                     ]
 
-                    user_low = user_text.lower() if user_text else ""
                     tokens_set = set(re.findall(r'[a-zA-Z0-9_]+', user_low))
                     is_disrespectful_msg = bool(tokens_set & TOXIC_WORDS_SET) or any(p in user_low for p in TOXIC_PHRASES)
 
