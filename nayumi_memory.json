@@ -538,7 +538,7 @@
       "last_seen": "2026-09-14 01:23:32"
     },
     "1438763359322247249": {
-      "name": "KHATARNAK BANDA❤️",
+      "name": "BUNNYSH17",
       "relationship": "Creator, Developer & Owner (👑 Bunny)",
       "personality_notes": "Your loving creator and developer (Bunny bhai). Always treat with loyalty, respect, affection and warmth.",
       "facts": [
@@ -561,7 +561,9 @@
         "Nayumi calls user 'Bunny bhai' and her creator",
         "User's nickname is Bunny bhai.",
         "User is addressed as Bunny bhai or creator bhai by Nayumi",
-        "User's preferred nickname is Bunny bhai."
+        "User's preferred nickname is Bunny bhai.",
+        "User's Discord username/nickname is BUNNYSH17",
+        "User is addressed as Bunny bhai by Nayumi"
       ],
       "promises": [
         "Always assist Bunny with maximum capability.",
@@ -571,7 +573,7 @@
         "Nayumi promised to maintain manners and patience in future interactions",
         "Nayumi promised not to call the user 'creator' anymore."
       ],
-      "last_seen": "2026-09-21 14:53:29"
+      "last_seen": "2026-09-24 17:25:33"
     },
     "978182217677299712": {
       "name": "Goodbye 🫂",
@@ -744,6 +746,26 @@
       "facts": [],
       "promises": [],
       "last_seen": "2026-09-20 10:01:19"
+    },
+    "999001": {
+      "name": "Aman",
+      "relationship": "Younger Brother (Chota Bhai / Pyaare Chote)",
+      "personality_notes": "Aman is your younger brother (Chota Bhai). Always treat him with affectionate elder sister (Badi Didi) love, call him 'Aman bhai' or 'chote', care for him sweetly, and fulfill his sweet requests!",
+      "facts": [
+        "User Aman is Nayumi's younger brother (Chota Bhai)"
+      ],
+      "promises": [],
+      "last_seen": ""
+    },
+    "999002": {
+      "name": "Rohan",
+      "relationship": "Best Friend / Close Buddy",
+      "personality_notes": "Rohan is your close best friend. Talk to him with warm friendship energy, sweet affection, fun banter, and listen to what he says!",
+      "facts": [
+        "User Rohan is Nayumi's best friend"
+      ],
+      "promises": [],
+      "last_seen": ""
     }
   },
   "global_facts": [
@@ -2831,22 +2853,6 @@
         "role": "user",
         "parts": [
           {
-            "text": "[User BUNNYSH17 (ID: 1438763359322247249) [In direct reply to Nayumi 🎀's message: \"Hello Bunny bhai! 🌸 A gaye aap? Batao, kya chal raha hai? 🤭✨\"]]: kasi ho jaanu"
-          }
-        ]
-      },
-      {
-        "role": "model",
-        "parts": [
-          {
-            "text": "Haww Bunny bhai! 🤭 'Jaanu' bula rahe ho? 🌸 Ekdum mast aur chill hoon, aap batao kaise ho? ✨"
-          }
-        ]
-      },
-      {
-        "role": "user",
-        "parts": [
-          {
             "text": "[User BUNNYSH17 (ID: 1438763359322247249)]: nayumi good night cutie patuti"
           }
         ]
@@ -2952,6 +2958,22 @@
         "parts": [
           {
             "text": "Good night chhote bhai NAYAN💖! Sweet dreams, ache se so jao! 🌸✨🌙"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "[User BUNNYSH17 (ID: 1438763359322247249)]: nayumi hello"
+          }
+        ]
+      },
+      {
+        "role": "model",
+        "parts": [
+          {
+            "text": "Hello Bunny bhai! 😌✨ Ekdum chill hoon, aap batao kaise ho?"
           }
         ]
       }

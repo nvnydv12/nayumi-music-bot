@@ -15,3 +15,6 @@ lavalink/*.jar
 lavalink/plugins/*.jar
 *.bak
 Groove-Music-main/
+demo_bot.py
+.env.demo
+demo_movie_bot/
