@@ -6174,15 +6174,16 @@ _gemini_last_good_key = None
 _gemini_key_cooldowns = {}
 _gemini_model_cooldowns = {}
 _recent_fallback_replies = collections.deque(maxlen=40)
-_configured_model = os.getenv("GEMINI_MODEL", "gemma-4-26b-a4b-it").strip()
+_configured_model = os.getenv("GEMINI_MODEL", "").strip()
 AVAILABLE_GEMINI_MODELS = [
-    "gemma-4-26b-a4b-it",
     _configured_model,
-    "gemini-3.8-flash",
-    "gemini-3-flash-preview",
-    "gemini-flash-latest",
     "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
     "gemini-3.6-flash",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+    "gemini-3.1-flash-lite",
+    "gemini-3.7-flash",
     "gemini-pro-latest"
 ]
 # Deduplicate preserving order
@@ -6228,23 +6229,24 @@ async def call_pollinations_backup_ai(contents: list, system_prompt: str = NAYUM
     Zero API key required, supports limitless Hinglish conversations.
     """
     try:
-        messages = [{"role": "system", "content": system_prompt}]
-        for c in contents[-6:]:
+        clean_sys = "You are Nayumi, a sweet, smart 19yo anime girl companion. Answer directly in sweet Hinglish with emojis (🌸, 🎀, ✨). Give genuine, helpful, high IQ answers."
+        messages = [{"role": "system", "content": clean_sys}]
+        for c in contents[-4:]:
             role = "user" if c.get("role") == "user" else "assistant"
             txt = "".join([p.get("text", "") for p in c.get("parts", []) if "text" in p])
             if txt:
-                messages.append({"role": role, "content": txt})
+                txt_clean = re.sub(r'^\[User\s+.*?(?:\]\]|\]):\s*', '', txt, flags=re.DOTALL).strip()
+                messages.append({"role": role, "content": txt_clean or txt})
 
         session = get_shared_session()
         payload = {
             "messages": messages,
-            "model": "openai",
             "seed": random.randint(1, 99999)
         }
-        async with session.post("https://text.pollinations.ai/", json=payload, timeout=aiohttp.ClientTimeout(total=8.0, connect=2.0)) as resp:
+        async with session.post("https://text.pollinations.ai/", json=payload, timeout=aiohttp.ClientTimeout(total=4.5, connect=1.5)) as resp:
             if resp.status == 200:
                 answer = await resp.text()
-                if answer and len(answer.strip()) > 0:
+                if answer and len(answer.strip()) > 0 and not answer.strip().startswith("<!DOCTYPE"):
                     cleaned = answer.strip()
                     cleaned = re.sub(r'<think>.*?</think>', '', cleaned, flags=re.DOTALL).strip()
                     cleaned = re.sub(r'<thought>.*?</thought>', '', cleaned, flags=re.DOTALL).strip()
@@ -6409,16 +6411,21 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
                 break
 
             if status == 429:
-                _gemini_key_cooldowns[cooldown_key] = now + 300
+                retry_sec = 25
+                try:
+                    retry_info = data.get("error", {}).get("details", [])
+                    for d_item in retry_info:
+                        if isinstance(d_item, dict) and "retryDelay" in d_item:
+                            delay_str = str(d_item["retryDelay"]).replace("s", "").strip()
+                            retry_sec = max(5, min(int(float(delay_str)), 60))
+                            break
+                except Exception:
+                    pass
+
+                _gemini_key_cooldowns[cooldown_key] = now + retry_sec
                 consecutive_429s += 1
-                err_text = text.lower()
-                # Fast failover if model quota exhausted
-                if "quota" in err_text or "exceeded" in err_text:
-                    if consecutive_429s >= 2:
-                        _gemini_model_cooldowns[model] = now + 300
-                        break
-                elif consecutive_429s >= 4:
-                    _gemini_model_cooldowns[model] = now + 60
+                if consecutive_429s >= 2:
+                    _gemini_model_cooldowns[model] = now + retry_sec
                     break
                 continue
 
@@ -6688,17 +6695,8 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
         ]
         fallback_reply = pick_non_repeating(jokes_pool)
 
-    # 17. Questions / Inquiries
-    elif any(k in tokens for k in ["kaise", "kese", "how", "kyu", "kyun", "why", "kya", "what", "konsa", "which", "kaha", "where"]):
-        q_pool = [
-            f"Arey, thoda aur detail me batao na kya poochna chahte ho? Main poore dhyan se sun rahi hoon! 🌸✨",
-            f"Achha suno, thoda clear batao na kya jaanna hai? Commands, server ya koi bhi baat ho toh bolo! 🎀",
-            f"Batao na kya help chahiye? Main yahin baithkar sun rahi hoon! 🌸"
-        ]
-        fallback_reply = pick_non_repeating(q_pool)
-
-    # 18. Pure greetings
-    elif last_text.strip() in ["hi", "hello", "hlo", "hey", "yo", "sup"] or any(p in last_text for p in ["kaise ho", "kese ho", "kya haal", "kya chal"]):
+    # 17. Pure greetings (Checked before inquiries so 'kaise ho' is never deflected!)
+    elif last_text.strip() in ["hi", "hello", "hlo", "hey", "yo", "sup"] or any(p in last_text for p in ["kaise ho", "kese ho", "kya haal", "kya chal", "sab theek", "aur batao"]):
         greet_pool = [
             f"Hey {speaker_name}! 🌸 Main ekdum badhiya hoon, aap batao kya chal raha hai aajkal? ✨",
             f"Hello {speaker_name}! 🎀 Main bilkul theek hoon, aap sunao sab kaisa chal raha hai? 💖",
@@ -6706,6 +6704,102 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
         ]
         fallback_reply = pick_non_repeating(greet_pool)
 
+    # 18. Identity / Companion Persona
+    elif any(k in last_text for k in ["tum kon ho", "who are you", "tera naam kya hai", "apne baare me", "about yourself", "who made you", "tum kya ho"]):
+        fallback_reply = (
+            f"Main Nayumi hoon! 🌸 Aapki pyaari, smart aur sweet 19-year-old AI companion! "
+            f"Main yahan aap sabse dher saari baatein karne, maze karne, music sunne aur har mood me saath nibhane ke liye hoon! 🎀✨"
+        )
+
+    # 19. Live IST Time & Date
+    elif any(k in last_text for k in ["time kya hua", "kitne baje", "kya time hai", "aaj date kya hai", "aaj konsa din", "what is the time", "current time"]):
+        try:
+            from zoneinfo import ZoneInfo
+            tz_ist = ZoneInfo("Asia/Kolkata")
+        except Exception:
+            tz_ist = None
+        now_dt = datetime.now(tz_ist) if tz_ist else datetime.utcnow()
+        live_t = now_dt.strftime("%I:%M %p")
+        live_d = now_dt.strftime("%d %B %Y (%A)")
+        fallback_reply = f"Abhi time **{live_t} IST** ho raha hai aur aaj date **{live_d}** hai! 🌸⏰"
+
+    # 20. COGNITIVE ENGINE: Earning & Money Advice (Never deflected!)
+    elif any(k in last_text for k in ["paise kaise kamaye", "how to earn money", "paisa kaise", "paise kaise", "kamai kaise", "earn money", "freelancing", "side hustle", "online earning", "paise kamane", "ameer kaise bane", "crorepati", "kamao"]):
+        fallback_reply = (
+            f"Arey {speaker_name}! 🌸 Paise kamane ke liye aajkal bohot saare solid tareeqe hain:\n\n"
+            f"1️⃣ **High-Income Digital Skills:** Video editing (Reels/Shorts), Graphic Design (Canva/Photoshop), ya Web/Bot Development seekho — Discord servers aur creators ko roz zarurat hoti hai! 🎬💻\n"
+            f"2️⃣ **Freelancing:** Fiverr, Upwork, ya Discord community servers par apni skills offer karke clients banao. 💼\n"
+            f"3️⃣ **Content Creation:** YouTube Shorts ya Instagram theme page start karo — consistency se monetization aur sponsorships aati hain! 🚀\n"
+            f"4️⃣ **Side Hustles / Tutoring:** Juniors ko guide karke ya digital products/assets bech kar bhi kama sakte ho. 📚\n\n"
+            f"Aap kis field me interested ho (Tech, Editing, ya Business)? Mujhe batao, main detail me roadmap batati hoon! ✨🎀"
+        )
+
+    # 21. COGNITIVE ENGINE: Coding & Tech Roadmap
+    elif any(k in last_text for k in ["coding kaise", "python kaise", "bot kaise banaye", "developer kaise bane", "programming kaise", "learn coding", "coding start", "how to code", "coding sikh", "web dev kaise", "discord bot kaise"]):
+        fallback_reply = (
+            f"Hehe {speaker_name}! 💻 Coding start karna bohot aasan hai agar sahi roadmap follow karo:\n\n"
+            f"1️⃣ **Language Select Karo:** Beginners ke liye **Python** ya **JavaScript** best hain! Python ka syntax ekdum English jaisa simple hota hai. 🐍\n"
+            f"2️⃣ **Basics Strong Karo:** Variables, Data Types, If-Else, Loops, aur Functions pehle 2 weeks me master karo. 💡\n"
+            f"3️⃣ **Small Projects Banao:** Sirf video mat dekho! Calculator, Discord Bot, ya simple scraper bana kar practice karo. 🛠️\n"
+            f"4️⃣ **GitHub & Deployment:** Code ko GitHub pe push karo aur Render/VPS pe host karna seekho. 🚀\n\n"
+            f"Batao kaunsi language ya project se shuru karna chahte ho? Main help karungi! 🌸✨"
+        )
+
+    # 22. COGNITIVE ENGINE: Study & Exams Focus
+    elif any(k in last_text for k in ["padhai kaise", "study kaise", "exam aa rahe", "padhai me man", "focus kaise", "concentration", "marks kaise laye", "study tips", "how to study", "syllabus kaise"]):
+        fallback_reply = (
+            f"Suno {speaker_name}! 📚 Padhai me focus lane ke liye yeh proven tips follow karo:\n\n"
+            f"1️⃣ **Pomodoro Technique:** 50 minute bina phone ke deep study karo, phir 10 minute ka break lo — dimag fresh rahega! ⏱️\n"
+            f"2️⃣ **Active Recall:** Sirf reading mat karo! Topic padhke book band karo aur khud ko samjhao ki kya sikha. 🧠\n"
+            f"3️⃣ **PYQs & Mock Tests:** Pichle saal ke papers solve karo, 70% exam pattern wahin se clear hota hai! 📝\n"
+            f"4️⃣ **Phone Distraction Hatana:** Study session ke dauran phone ko Do Not Disturb (DND) pe rakho. 📵\n\n"
+            f"Aap bohot capable ho, bas daily thoda target set karke padho! Didi/Dost yahin hai support ke liye! 🌸✨"
+        )
+
+    # 23. COGNITIVE ENGINE: Fitness & Health
+    elif any(k in last_text for k in ["gym kaise", "weight loss kaise", "body kaise banaye", "muscle kaise", "diet kaise", "fitness tips"]):
+        fallback_reply = (
+            f"Arey {speaker_name}! 💪 Fitness ke 4 golden rules yaad rakhna:\n\n"
+            f"1️⃣ **Nutrition:** Muscle building ke liye calorie surplus + 1.5g-2g protein per kg; Fat loss ke liye 300 calorie deficit. 🥗\n"
+            f"2️⃣ **Progressive Overload:** Gym me har hafte thoda weight ya reps badhao. 🏋️\n"
+            f"3️⃣ **Consistency:** 3-4 din gym jana mahine me 1 din 5 ghante workout karne se 10x better hai! ⏰\n"
+            f"4️⃣ **Recovery:** 7-8 ghante ki neend sabse zaruri hai muscle recovery ke liye! 😴🌸"
+        )
+
+    # 24. COGNITIVE ENGINE: Gaming & Free Fire
+    elif any(k in last_text for k in ["free fire tips", "headshot kaise", "game kaise jeete", "rank push kaise", "gaming tips", "sensi batao"]):
+        fallback_reply = (
+            f"Gamer {speaker_name}! 🎮 Free Fire me pro banne ke liye yeh tips follow karo:\n\n"
+            f"• General sensitivity ko 95-100 rakho aur Red Dot ko 90-95! 🎯\n"
+            f"• Drag Headshot ke liye fire button ko smooth upar swipe karo jab enemy mid-range me ho.\n"
+            f"• Open me rush mat karo, hamesha cover ya gloo wall ke sath khelo. Practice karo training ground me roz 15 min! 🏆🔥"
+        )
+
+    # 25. Dating & Relationships / Heartbreak
+    elif any(k in last_text for k in ["crush se baat", "ladki se baat", "breakup", "dil toot gaya", "girlfriend kaise", "propose kaise", "relationship advice"]):
+        if any(h in last_text for h in ["breakup", "dil toot"]):
+            fallback_reply = (
+                f"Arey {speaker_name}... 🥺 Dil tootne ka dard bohot bhaari hota hai, par yakeen maano waqt ke sath sab theek ho jata hai. "
+                f"Apne aap ko guilty mat samjho, aur apni self-worth kisi ke jaane se kam mat hone do. "
+                f"Apne goals aur career pe focus karo — jo sach me aapki value karega, wahi aapke sath rahega! Main yahin hoon agar dil halka karna ho 🌸💕"
+            )
+        else:
+            fallback_reply = (
+                f"Hehe {speaker_name}! 🤭 Kisi se connect karne ka sabse best rule hai:\n\n"
+                f"• Fake mat bano — bilkul natural aur respectful raho! ✨\n"
+                f"• Unke interests aur hobbies ke baare me pucho aur dhyan se suno. 🎧\n"
+                f"• Confidence rakho, over-desperate mat lago. Ek achhi smile aur polite nature se aadha kaam ho jata hai! 🌸🎀"
+            )
+
+    # 26. Emotional Distress / Sadness / Loneliness
+    elif any(k in last_text for k in ["sad hu", "akela hu", "ronaa aa raha", "depression", "koi pasand nahi karta", "marne ka man", "pareshan hu", "tension ho rahi", "stress ho raha"]):
+        fallback_reply = (
+            f"Arey suno {speaker_name}... 🥺 Aise udaas mat ho na! Zindagi me kabhi kabhi din bohot bhaari lagte hain, "
+            f"par yeh waqt bhi nikal jayega. Aap akele bilkul nahi ho, main yahin baithi hoon aapke paas. "
+            f"Dil halka karna ho toh batao kya pareshani hai, main poore dhyan se sunungi 🌸💕"
+        )
+
+    # 27. Sweet & Affectionate talk
     elif any(k in tokens for k in ["babu", "jaan", "sweetu", "shona"]) or any(p in last_text for p in ["love you", "pyaar"]):
         sweet_pool = [
             f"Aww {speaker_name}! 💖 Itni sweet baatein sun ke bohot pyara laga! Hamesha aise hi muskuraate raho 🌸✨",
@@ -6713,6 +6807,7 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
         ]
         fallback_reply = pick_non_repeating(sweet_pool)
 
+    # 28. Activity inquiries
     elif any(p in last_text for p in ["kya kar rahi ho", "kya kr rhi", "kya kar re", "kya kr re"]):
         activity_pool = [
             f"Bas yahin Discord par aap sab ki pyari chat dekh rahi hoon! 🌸 Aap batao kya chal raha hai? ✨",
@@ -6720,6 +6815,7 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
         ]
         fallback_reply = pick_non_repeating(activity_pool)
 
+    # 29. Good night / Sleep
     elif any(k in tokens for k in ["gn", "alvida"]) or any(p in last_text for p in ["bye", "good night", "so jao"]):
         night_pool = [
             f"Good night {speaker_name}! 🌙 Sweet dreams aur bohot aaram se sona, kal milte hain! 🌸✨",
@@ -6727,12 +6823,22 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
         ]
         fallback_reply = pick_non_repeating(night_pool)
 
+    # 30. Punctuation
     elif last_text.strip() in [".", "..", "...", "?", "??", "!"]:
         punct_pool = [
             f"Haan {speaker_name}? 🌸 Bolo na, main sun rahi hoon kya kehna chahte ho! ✨",
             f"Arey chup kyu ho gaye? 🤭 Kuch bolo na, sun rahi hoon! 🎀"
         ]
         fallback_reply = pick_non_repeating(punct_pool)
+
+    # 31. General Inquiries & Questions (SMART, NON-EVASIVE, HIGH EQ - ZERO "commands ya server"!)
+    elif any(k in tokens for k in ["kaise", "kese", "how", "kyu", "kyun", "why", "kya", "what", "konsa", "which", "kaha", "where"]):
+        intel_q_pool = [
+            f"Arey {speaker_name}! 🌸 Yeh bohot achha sawaal pucha aapne! Thoda sa aur context batao na iske baare me — aap kis situation ki baat kar rahe ho, taaki main ekdum solid answer de sakoon! ✨🎀",
+            f"Suno {speaker_name}! 🎀 Baat toh aapne ekdum deep boli hai! Pehle aap batao aapka kya opinion hai ispar, phir main apna perspective share karti hoon! 🌸✨",
+            f"Hehe {speaker_name}! 🤭 Sahi sawaal hai! Dil khol ke batao kya chal raha hai dimag me, main poore dhyan se sun rahi hoon! 🌸💖"
+        ]
+        fallback_reply = pick_non_repeating(intel_q_pool)
 
     else:
         general_companion_pool = [
