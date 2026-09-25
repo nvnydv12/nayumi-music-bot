@@ -1157,10 +1157,65 @@ class AgentEngine:
             exec_res = await execute_tool(tool_name.strip(), kwargs, context)
             executed_results.append({"tool": tool_name.strip(), "params": kwargs, "result": exec_res})
 
+        # Parse JSON format tool calls or OpenAI function calling leaks (e.g. {"role":"assistant","tool_calls":[...]})
+        if any(marker in clean_text for marker in ['"tool_calls"', '"function"', '"role": "assistant"', '"role":"assistant"']):
+            json_candidates = []
+            cb_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', clean_text)
+            if cb_match:
+                json_candidates.append(cb_match.group(1))
+            st_raw = clean_text.strip()
+            if st_raw.startswith('{') and st_raw.endswith('}'):
+                json_candidates.append(st_raw)
+            else:
+                m_raw = re.search(r'(\{[\s\S]*"tool_calls"[\s\S]*\})', clean_text)
+                if m_raw:
+                    json_candidates.append(m_raw.group(1))
+
+            for cand in json_candidates:
+                try:
+                    data = json.loads(cand)
+                    if isinstance(data, dict):
+                        # Extract tool_calls
+                        raw_tcs = data.get("tool_calls", [])
+                        for tc in raw_tcs:
+                            fn = tc.get("function", {})
+                            t_name = fn.get("name", "").strip()
+                            t_args = fn.get("arguments", {})
+                            if isinstance(t_args, str):
+                                try:
+                                    t_args = json.loads(t_args) if t_args.strip() else {}
+                                except Exception:
+                                    t_args = {}
+                            if t_name and not any(r.get("tool") == t_name for r in executed_results):
+                                exec_res = await execute_tool(t_name, t_args, context)
+                                executed_results.append({"tool": t_name, "params": t_args, "result": exec_res})
+
+                        # Extract clean dialogue text
+                        content = data.get("content") or ""
+                        if content and isinstance(content, str) and content.strip():
+                            clean_text = content.strip()
+                        elif executed_results:
+                            t_first = executed_results[0].get("tool")
+                            if t_first == "standby_mode":
+                                clean_text = "Theek hai, main standby mode me jaa rahi hoon! 😴 Jab bhi zarurat ho `@Nayumi wake up` bol dena 🌸✨"
+                            elif t_first == "wakeup_mode":
+                                clean_text = "Aankh khul gayi! ⚡ Main wapas online aa gayi hoon, boliye kya help chahiye? 🌸✨"
+                            elif t_first == "play_music":
+                                clean_text = "Song queue me laga diya hai! 🎵 Enjoy karo! 🌸✨"
+                            else:
+                                clean_text = "Done! Kaam ho gaya! 🌸✨"
+                        else:
+                            clean_text = ""
+                        break
+                except Exception:
+                    pass
+
         # Strip all [ACTION: ...] tags including any surrounding markdown stars or extra whitespace
         clean_text = re.sub(r'\*?\*?\[\s*ACTION:\s*[a-zA-Z0-9_]+(?:\(.*?\))?\s*\]\*?\*?', '', clean_text, flags=re.DOTALL)
         clean_text = re.sub(r'\[(?:Nayumi\'s Reply to|Reply to|Nayumi to)[^\]]+\]:\s*', '', clean_text, flags=re.IGNORECASE)
         clean_text = re.sub(r'^\s*(?:\([^)]+\)|\*[^*]+\*)\s*', '', clean_text)
+        # Strip any leaked raw JSON assistant objects
+        clean_text = re.sub(r'\{[\s\S]*?"tool_calls"[\s\S]*?\}', '', clean_text)
 
         # Strip internal analysis / reasoning bullet preambles and metadata leaks
         clean_text = re.sub(r'^(?:Message:\s*["\'][^"\']+["\']\s*\*?\s*)+', '', clean_text, flags=re.IGNORECASE)

@@ -6723,7 +6723,22 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
         live_d = now_dt.strftime("%d %B %Y (%A)")
         fallback_reply = f"Abhi time **{live_t} IST** ho raha hai aur aaj date **{live_d}** hai! 🌸⏰"
 
-    # 20. COGNITIVE ENGINE: Earning & Money Advice (Never deflected!)
+    # 20. EMERGENCY CRISIS & SUICIDE DETECTION (Life Safety & Financial Loss Grounding)
+    elif any(k in last_text for k in ["suicide", "sucide", "kill myself", "mar jaunga", "jaan de dunga", "mar jau", "khudkushi", "aatmahatya", "end my life"]) or (any(l in last_text for l in ["loss", "3lakh", "3 lakh", "karza", "debt"]) and any(s in last_text for s in ["papa", "give back", "wapas", "sucide", "suicide", "marna", "bachao"])):
+        fallback_reply = (
+            f"Arey {speaker_name}, meri baat ek second ruk kar bohot dhyan se suno... 🥺💔\n\n"
+            f"Pehle ek gehri saans lo aur bilkul shant ho jao. **Aise suicide ya jaan dene ki baat bilkul mat socho!**\n\n"
+            f"Chahe 3 lakh ka loss ho ya kitna bhi bada nuksan hua ho, yeh sach hai ki paisa bohot mehnat se aata hai... "
+            f"par **paisa wapas kamaya ja sakta hai, aapki jaan kabhi wapas nahi aayegi!** "
+            f"Aapke papa ke liye unke bachhe ki zindagi duniya ke kisi bhi 3 lakh se hazar guna zyada anmol hai.\n\n"
+            f"📌 **Abhi aapko kya karna chahiye:**\n"
+            f"1️⃣ **Papa se sach bata do:** Haal-e-dil sach sach bol do. Thoda gussa aayega, thodi daant padegi, par parivaar hamesha saath deta hai. Chupana ya galat kadam uthana unhe zindagi bhar ke liye tod dega.\n"
+            f"2️⃣ **Recovery Plan:** Har mahine chota-mota job, freelancing ya sales karke 15-20k save karke 1-2 saal me saara loss recover ho sakta hai. Zindagi bohot lambi hai!\n"
+            f"3️⃣ **Free Support Call:** Agar zyada ghabrahat ho rahi ho, toh please Tele-MANAS helpline **14416** ya Kiran helpline **1800-599-0019** par baat karo — yeh bilkul free aur confidential hai.\n\n"
+            f"Main yahin baithi hoon aapke paas, himmat rakho! Hum milkar rasta nikalenge 🌸💕"
+        )
+
+    # 21. COGNITIVE ENGINE: Earning & Money Advice (Never deflected!)
     elif any(k in last_text for k in ["paise kaise kamaye", "how to earn money", "paisa kaise", "paise kaise", "kamai kaise", "earn money", "freelancing", "side hustle", "online earning", "paise kamane", "ameer kaise bane", "crorepati", "kamao"]):
         fallback_reply = (
             f"Arey {speaker_name}! 🌸 Paise kamane ke liye aajkal bohot saare solid tareeqe hain:\n\n"
