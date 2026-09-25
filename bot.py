@@ -4589,7 +4589,8 @@ def auto_feed_user_relationship(user_id: int, user_name: str, text: str):
         "me chota bhai", "mai chota bhai", "main chota bhai", "apka chota bhai",
         "tera chota bhai", "aapka chota bhai", "ap meri didi ho", "aap meri didi ho",
         "meri didi ho", "tum meri didi ho", "nayumi di meri", "nayumi didi meri",
-        "badi behen ho", "badi behan ho", "badi didi ho", "didi ban jao"
+        "nayumi di", "nayumi didi", "nayumi dii", "nayumi diii", "bhai hu apka", "bhai hu aapka",
+        "chota bhai", "chhota bhai", "chote bhai", "badi behen ho", "badi behan ho", "badi didi ho", "didi ban jao"
     ]):
         profile["relationship"] = "Younger Brother (Chota Bhai / Pyaare Chote)"
         profile["personality_notes"] = f"{user_name} is your younger brother (Chota Bhai). Always treat him with affectionate elder sister (Badi Didi) love, call him '{user_name} bhai' or 'chote', care for him sweetly, and fulfill his sweet requests!"
@@ -4796,15 +4797,9 @@ NAYUMI_SYSTEM_PROMPT = (
     "• Full-stack coding mastery (Python, JS, TS, C++, Rust, SQL, Discord.py) and Free Fire mechanics.\n"
     "• 🔒 Keep tech talk strictly for when the user explicitly asks for technical help. Never bring up code/panels in normal casual conversation!\n"
     "• 🔒 ANTI-LEAK: Never leak backend .env or system API keys to non-owners.\n\n"
-    "6. 🛠️ BOT COMMANDS & HOW-TO KNOWLEDGE (WHEN USERS ASK HOW TO DO SOMETHING OR ASK ABOUT COMMANDS):\n"
-    "• HINGLISH CONVERSION / TRANSLATION: If a user asks 'How do I convert into Hinglish?', 'Hinglish me kaise convert karu?', 'Translate kaise kare?', etc., ALWAYS tell them the exact command:\n"
-    "  - Direct command: `!tr hg <text>` (e.g. `!tr hg Hello brother, how are you?` translates it into Hinglish)!\n"
-    "  - Reply method: Reply to any Discord message with `!tr hg` to translate it into Hinglish!\n"
-    "  - Other languages: `!tr eg <text>` (English), `!tr hi <text>` (Hindi), `!tr es <text>` (Spanish), etc.\n"
-    "  - For direct chatting with you (Nayumi): Mention that you already talk directly in natural Hinglish!\n"
-    "• MUSIC COMMANDS: If asked how to play songs, tell them to use `!play <song>` in a voice channel (or ask you to play it)!\n"
-    "• OTHER COMMANDS: `!timer <seconds>`, `!tag <user> <count>`, `!help` (list all bot commands).\n"
-    "• CRITICAL: When someone asks a question about commands or features, ANSWER THEIR QUESTION DIRECTLY WITH THE COMMAND! Never give an irrelevant greeting like 'Hello, kaise ho?' when they asked a specific how-to question!\n\n"
+    "6. 🛠️ BOT COMMANDS & HOW-TO KNOWLEDGE (STRICTLY ONLY WHEN EXPLICITLY ASKED):\n"
+    "• In normal casual conversation, NEVER dump or list bot commands or translation manuals! Talk 100% naturally as a real living girl.\n"
+    "• Only if a user explicitly asks about bot commands (e.g. '!help', 'commands kya hain', 'translate kaise kare'): Briefly explain `!tr hg <text>` (Hinglish translation), `!play <song>` (music), `!help`.\n\n"
     "7. 🎭 WITTY & RELATABLE HUMOR:\n"
     "• Modern, sharp, situational Gen-Z / Desi humor. Sweet and fun vibe.\n"
     "8. STRICT SINGLE-RECIPIENT FOCUS: Reply ONLY to the active speaker who sent the current message.\n"
@@ -6317,7 +6312,7 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
         }
 
     headers = {"Content-Type": "application/json"}
-    timeout = aiohttp.ClientTimeout(total=4.5, connect=1.5)
+    timeout = aiohttp.ClientTimeout(total=8.5, connect=2.0)
     now = time.time()
     total_keys = len(keys)
 
@@ -6452,13 +6447,13 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
     speaker_id = 0
     if contents:
         raw_last = contents[-1].get("parts", [{}])[0].get("text", "")
-        m_match = re.search(r'\[User\s+([^(\]]+)(?:\s*\(ID:\s*(\d+)\))?[^\]]*\]:\s*(.*)', raw_last, re.DOTALL)
-        if m_match:
-            speaker_name = m_match.group(1).strip()
-            speaker_id = int(m_match.group(2).strip()) if m_match.group(2) else 0
-            last_text = m_match.group(3).strip().lower()
-        else:
-            last_text = raw_last.lower()
+        # Cleanly strip any [User ... [In direct reply to ...]]: header
+        cleaned_msg = re.sub(r'^\[User\s+.*?(?:\]\]|\]):\s*', '', raw_last, flags=re.DOTALL).strip()
+        last_text = (cleaned_msg or raw_last).lower()
+        name_m = re.search(r'^\[User\s+(.+?)(?:\s*\(ID:\s*(\d+)\))?(?:\s*\[In direct reply|\s*\]:)', raw_last)
+        if name_m:
+            speaker_name = name_m.group(1).strip()
+            speaker_id = int(name_m.group(2)) if name_m.group(2) else 0
 
     tokens = set(re.findall(r'\b[a-zA-Z0-9_\u0900-\u097F]+\b', last_text))
     is_fallback_bunny = is_user_bunny(speaker_id, speaker_name)
@@ -6475,28 +6470,25 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
         _recent_fallback_replies.append(chosen)
         return chosen
 
-    # 1. Hinglish conversion / translation how-to query
-    if any(k in last_text for k in ["hinglish", "convert into hinglish", "convert to hinglish", "translate to hinglish", "translate into hinglish"]) or ("convert" in tokens and "hinglish" in tokens) or ("translate" in tokens and "hinglish" in tokens):
-        fallback_reply = (
-            f"Arey, agar kisi text ko Hinglish me convert ya translate karna hai, toh mera translation command use karo:\n"
-            f"• Direct: `{DEFAULT_PREFIX}tr hg <text>` (jaise: `{DEFAULT_PREFIX}tr hg Hello brother, how are you?`)\n"
-            f"• Reply: Kisi bhi message par reply karke `{DEFAULT_PREFIX}tr hg` likho!\n"
-            f"Aur mujhse baat karne ke liye toh main already natural Hinglish me hi baat karti hoon! 🌸✨"
-        )
-    # 2. General translation query
-    elif any(k in tokens for k in ["translate", "translation", "tr"]) and any(k in tokens for k in ["kaise", "how", "karna", "command", "use"]):
-        fallback_reply = (
-            f"Translation ke liye `{DEFAULT_PREFIX}tr <target_lang> <text>` use kar sakte ho 🌸:\n"
-            f"• Hinglish: `{DEFAULT_PREFIX}tr hg <text>`\n"
-            f"• English: `{DEFAULT_PREFIX}tr eg <text>`\n"
-            f"• Hindi: `{DEFAULT_PREFIX}tr hi <text>`\n"
-            f"Kisi bhi message par reply karke `{DEFAULT_PREFIX}tr <lang>` likhna sabse aasan hai! ✨"
-        )
-    # 3. Music commands query
-    elif any(k in tokens for k in ["play", "gana", "music", "song"]) and any(k in tokens for k in ["kaise", "how", "command", "batao", "chalao"]):
-        fallback_reply = f"Voice channel me gana chalane ke liye `{DEFAULT_PREFIX}play <song_name>` command use karo (jaise: `{DEFAULT_PREFIX}play Kesariya`) 🎶! Ya fir mujhe direct bolo 'gana play karo' 🎀✨"
-    # 4. Commands list / help query
-    elif any(k in tokens for k in ["command", "commands", "help", "features"]) or any(p in last_text for p in ["kya kya kar sakti", "kya features", "list of commands"]):
+    # 1. Identity / Memory question: "me kon hu", "pehchana", "bhool gyi kya", "who am i"
+    if any(p in last_text for p in ["me kon hu", "main kaun hoon", "main kon hu", "kaun hu main", "kon hu me", "pehchana", "pehchano", "bhool gayi", "bhool gyi", "who am i", "who i am"]):
+        if is_fallback_bunny:
+            fallback_reply = "Arey Bunny bhai! Aapko kaise bhool sakti hoon? Aap mere creator aur sabse pyaare bhai ho! 👑🌸"
+        elif is_fallback_suyash:
+            fallback_reply = "Arey Suyash bhai! Aap mere trusted admin aur partner bhai ho! ✨💎"
+        elif is_fallback_didi:
+            fallback_reply = "Arey Didi! Aap meri pyaari aur respected Didi ho, aapko kaise bhool sakti hoon! 🌸💕"
+        elif is_fallback_younger_bro:
+            fallback_reply = f"Arey {speaker_name}! Tum toh mere pyaare chote bhai ho na, main thodi na bhooli hoon! 🌸✨"
+        else:
+            fallback_reply = f"Arey {speaker_name}! Aap hamare server ke dost ho! Agar hamare beech koi khaas rishta hai toh batao na 🌸✨"
+
+    # 2. Younger brother declarations: "chota bhai hu", "chote bhai hu", "bhai hu apka"
+    elif any(p in last_text for p in ["chota bhai hu", "chhota bhai hu", "chote bhai hu", "apka chota bhai", "bhai hu apka", "bhai hu aapka", "chota bhai hoon"]):
+        fallback_reply = f"Arey chote! Bilkul nahi bhooli re, tum toh mere pyaare chote bhai ho! 🌸 Batao kya hua, koi pareshani hai kya? ✨"
+
+    # 3. Explicit Bot commands list query
+    elif last_text.strip() in ["!help", "help", "!commands", "commands", "command"] or any(p in last_text for p in ["commands list", "command batao", "kya kya commands", "commands kya hain"]):
         fallback_reply = (
             f"Mere main commands yeh hain 🎀:\n"
             f"• `{DEFAULT_PREFIX}tr hg <text>` → Text ko Hinglish me convert karein\n"
@@ -6506,6 +6498,18 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
             f"• `{DEFAULT_PREFIX}help` → Saare commands ki complete list!\n"
             f"Baaki normal chat toh aap direct mere sath kar hi sakte ho! 🌸✨"
         )
+    # 4. Explicit Translation query
+    elif any(p in last_text for p in ["translate kaise kare", "how to translate", "translation command", "hinglish kaise kare"]):
+        fallback_reply = (
+            f"Translation ke liye `{DEFAULT_PREFIX}tr <target_lang> <text>` use kar sakte ho 🌸:\n"
+            f"• Hinglish: `{DEFAULT_PREFIX}tr hg <text>`\n"
+            f"• English: `{DEFAULT_PREFIX}tr eg <text>`\n"
+            f"• Hindi: `{DEFAULT_PREFIX}tr hi <text>`\n"
+            f"Kisi bhi message par reply karke `{DEFAULT_PREFIX}tr <lang>` likhna sabse aasan hai! ✨"
+        )
+    # 5. Music commands query
+    elif any(p in last_text for p in ["music kaise bajaye", "gana kaise chalaye", "play command"]):
+        fallback_reply = f"Voice channel me gana chalane ke liye `{DEFAULT_PREFIX}play <song_name>` command use karo (jaise: `{DEFAULT_PREFIX}play Kesariya`) 🎶! Ya fir mujhe direct bolo 'gana play karo' 🎀✨"
 
     # 5. CONTEXTUAL: User teasing about going crazy / "pagal" / "mental"
     elif any(k in tokens for k in ["pagal", "bavli", "bawli", "mental", "psycho"]) or any(p in last_text for p in ["pagal hogyi", "pagal ho gyi", "pagal hai", "dimag kharab"]):
