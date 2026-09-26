@@ -476,6 +476,65 @@ def tool_wakeup_mode(context: Dict[str, Any]) -> str:
 
 
 @register_tool(
+    name="maintenance_mode",
+    description="Toggles the bot's global maintenance mode ON or OFF, or checks status. When ON, all commands and chat interactions are blocked for regular users. Only Bot Owners / Developers (Bunny/Suyash) can use this tool.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["on", "off", "status"],
+                "description": "'on' to activate maintenance mode, 'off' to disable maintenance mode, 'status' to check current state."
+            },
+            "reason": {
+                "type": "string",
+                "description": "Optional reason for maintenance mode (e.g. 'Server migration and system upgrades')."
+            }
+        },
+        "required": ["action"]
+    },
+    risk_level=RISK_LOW,
+    owner_only=True
+)
+def tool_maintenance_mode(context: Dict[str, Any], action: str = "status", reason: str = "", **kwargs) -> str:
+    user_id = context.get("user_id") or 0
+    is_owner = context.get("is_owner", False)
+    message = context.get("message")
+    user_obj = message.author if message else None
+
+    # Check bot developer or owner
+    is_dev = is_owner
+    try:
+        from bot import is_bot_developer_or_owner
+        if is_bot_developer_or_owner(user_id, user_obj):
+            is_dev = True
+    except Exception:
+        pass
+
+    if not is_dev:
+        return "Permission denied: Only Bot Owners/Developers (Bunny / Suyash) can manage global maintenance mode."
+
+    try:
+        from bot import get_global_maintenance_info, set_global_maintenance
+    except ImportError:
+        return "Maintenance system unavailable in bot core."
+
+    act = (action or "status").strip().lower()
+    if act == "on":
+        user_name = getattr(user_obj, "display_name", "") or getattr(user_obj, "name", "Developer")
+        res = set_global_maintenance(True, reason=reason, user_id=user_id, user_name=user_name)
+        return f"Global Maintenance Mode has been activated. Reason: '{res.get('reason')}'. All regular user commands and AI chats are now paused."
+    elif act == "off":
+        user_name = getattr(user_obj, "display_name", "") or getattr(user_obj, "name", "Developer")
+        res = set_global_maintenance(False, user_id=user_id, user_name=user_name)
+        return "Global Maintenance Mode has been deactivated. All commands and AI chats are back online."
+    else:
+        info = get_global_maintenance_info()
+        st = "ACTIVE (ON)" if info.get("enabled") else "INACTIVE (OFF)"
+        return f"Maintenance Mode is currently {st}. Reason: '{info.get('reason', 'N/A')}', Enabled By: '{info.get('enabled_by_name', 'N/A')}'."
+
+
+@register_tool(
     name="send_dm",
     description="Sends a direct private message (DM) to any Discord user/member on behalf of Bunny with stylish formatting.",
     parameters={
@@ -1200,6 +1259,12 @@ class AgentEngine:
                                 clean_text = "Theek hai, main standby mode me jaa rahi hoon! 😴 Jab bhi zarurat ho `@Nayumi wake up` bol dena 🌸✨"
                             elif t_first == "wakeup_mode":
                                 clean_text = "Aankh khul gayi! ⚡ Main wapas online aa gayi hoon, boliye kya help chahiye? 🌸✨"
+                            elif t_first == "maintenance_mode":
+                                act_arg = executed_results[0].get("params", {}).get("action", "")
+                                if act_arg == "off":
+                                    clean_text = "Maintenance mode off kar diya hai! ⚡ Nayumi wapas sabhi ke liye online hai 🌸✨"
+                                else:
+                                    clean_text = "Done Sir! Maintenance mode activate ho gaya hai 🛠️ Abhi koi user command use nahi kar payega jab tak aap off na bolo 🔒✨"
                             elif t_first == "play_music":
                                 clean_text = "Song queue me laga diya hai! 🎵 Enjoy karo! 🌸✨"
                             else:

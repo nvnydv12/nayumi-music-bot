@@ -308,6 +308,70 @@ def is_admin_or_owner(user_id: int, member: Any = None) -> bool:
         pass
     return False
 
+def is_bot_developer_or_owner(user_id: int, user_obj: Any = None) -> bool:
+    """
+    Strict check for actual Bot Developers / Creators / Bot Owners (Bunny, Suyash, OWNER_IDS, TRUSTED_ADMIN_IDS).
+    Does NOT include standard guild administrators.
+    """
+    try:
+        uid = int(user_id)
+        if uid in OWNER_IDS or uid in TRUSTED_ADMIN_IDS or uid in BUNNY_IDS or uid in SUYASH_IDS:
+            return True
+    except Exception:
+        pass
+    disp = str(getattr(user_obj, "display_name", "") or getattr(user_obj, "name", "")).strip() if user_obj else ""
+    user_name = str(getattr(user_obj, "name", "")).strip() if user_obj else ""
+    return is_user_bunny(user_id, disp or user_name) or is_user_suyash(user_id, disp or user_name)
+
+GLOBAL_MAINTENANCE_FILE = os.path.join(os.path.dirname(__file__), "nayumi_maintenance.json")
+
+def get_global_maintenance_info() -> dict:
+    """Returns the current global maintenance mode configuration dictionary."""
+    default_state = {
+        "enabled": False,
+        "reason": "Nayumi is currently undergoing scheduled system maintenance & upgrades.",
+        "enabled_by_id": 0,
+        "enabled_by_name": "Developer",
+        "enabled_at": None
+    }
+    if not os.path.exists(GLOBAL_MAINTENANCE_FILE):
+        return default_state
+    try:
+        with open(GLOBAL_MAINTENANCE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return {**default_state, **data}
+    except Exception as e:
+        print(f"[MAINTENANCE] Error reading {GLOBAL_MAINTENANCE_FILE}: {e}", flush=True)
+    return default_state
+
+def is_global_maintenance_enabled() -> bool:
+    """Quick boolean check if global maintenance mode is active."""
+    return bool(get_global_maintenance_info().get("enabled", False))
+
+def set_global_maintenance(enabled: bool, reason: str = "", user_id: int = 0, user_name: str = "") -> dict:
+    """Sets the global maintenance mode state and persists to disk."""
+    current = get_global_maintenance_info()
+    current["enabled"] = bool(enabled)
+    if enabled:
+        clean_reason = str(reason).strip()
+        current["reason"] = clean_reason if clean_reason else "Scheduled system maintenance & upgrades."
+        if user_id:
+            current["enabled_by_id"] = int(user_id)
+        if user_name:
+            current["enabled_by_name"] = str(user_name).strip()
+        current["enabled_at"] = datetime.now(timezone.utc).isoformat()
+    else:
+        current["enabled_at"] = None
+
+    try:
+        with open(GLOBAL_MAINTENANCE_FILE, "w", encoding="utf-8") as f:
+            json.dump(current, f, indent=2, ensure_ascii=False)
+        print(f"[MAINTENANCE] State updated: enabled={current['enabled']}, reason={current.get('reason')}", flush=True)
+    except Exception as e:
+        print(f"[MAINTENANCE] Error writing {GLOBAL_MAINTENANCE_FILE}: {e}", flush=True)
+    return current
+
 def get_user_display_greeting_name(user: Any) -> str:
     """
     Returns a clean, friendly recognized name for the user.
@@ -3369,6 +3433,87 @@ async def command_access_guard(ctx, command_name):
         return False
 
     return True
+
+
+MAINTENANCE_CONTROL_COMMANDS = {
+    "maintenance", "maint", "botmaintenance", "maintain", "maintenancemode"
+}
+
+@bot.check
+async def global_maintenance_check(ctx):
+    # Allow the maintenance command itself to run so developers can configure/disable it
+    if ctx.command:
+        cmd_name = ctx.command.name.lower()
+        if cmd_name in MAINTENANCE_CONTROL_COMMANDS:
+            return True
+        for alias in getattr(ctx.command, "aliases", []):
+            if alias.lower() in MAINTENANCE_CONTROL_COMMANDS:
+                return True
+
+    maint_info = get_global_maintenance_info()
+    if not maint_info.get("enabled", False):
+        return True
+
+    # Bot developers and owners always bypass maintenance mode
+    if is_bot_developer_or_owner(ctx.author.id, ctx.author):
+        return True
+
+    reason = maint_info.get("reason", "Nayumi is currently undergoing scheduled system maintenance & upgrades.")
+    author_name = maint_info.get("enabled_by_name", "Developer")
+
+    embed = discord.Embed(
+        title=f"{E_GEAR} Nayumi Under Maintenance",
+        description=(
+            f"**Nayumi is currently in Maintenance Mode!** ⚠️\n\n"
+            f"> 🛠️ **Reason:** {reason}\n"
+            f"> 👤 **Initiated By:** `{author_name}`\n"
+            f"> ⏳ All commands and chat features are temporarily paused for maintenance, upgrades, and system improvements.\n\n"
+            f"Please check back shortly! Thank you for your patience 💖"
+        ),
+        color=0xF59E0B
+    )
+    if bot.user and bot.user.display_avatar:
+        embed.set_footer(text="Nayumi Core • System Operations", icon_url=bot.user.display_avatar.url)
+    else:
+        embed.set_footer(text="Nayumi Core • System Operations")
+
+    try:
+        await ctx.reply(embed=embed, mention_author=False)
+    except Exception:
+        try:
+            await ctx.send(embed=embed)
+        except Exception:
+            pass
+
+    return False
+
+@bot.tree.interaction_check
+async def global_interaction_maintenance_check(interaction: discord.Interaction) -> bool:
+    maint_info = get_global_maintenance_info()
+    if not maint_info.get("enabled", False):
+        return True
+    if is_bot_developer_or_owner(interaction.user.id, interaction.user):
+        return True
+
+    reason = maint_info.get("reason", "Nayumi is currently undergoing scheduled system maintenance & upgrades.")
+    embed = discord.Embed(
+        title=f"{E_GEAR} Nayumi Under Maintenance",
+        description=(
+            f"**Nayumi is currently in Maintenance Mode!** ⚠️\n\n"
+            f"> 🛠️ **Reason:** {reason}\n"
+            f"> ⏳ All commands and chat features are temporarily paused for routine maintenance."
+        ),
+        color=0xF59E0B
+    )
+    embed.set_footer(text="Nayumi Core • System Operations")
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception:
+        pass
+    return False
 
 
 CHANNEL_CONTROL_COMMANDS = {
@@ -10541,6 +10686,108 @@ async def shutdown_cmd(ctx):
     await bot.close()
 
 
+@bot.command(name="maintenance", aliases=["maint", "maintain", "botmaintenance", "maintenancemode"])
+async def maintenance_cmd(ctx, action: str = None, *, reason: str = None):
+    """
+    Toggles or inspects Global Maintenance Mode.
+    Usage:
+      !maintenance on [reason]   - Activates maintenance mode (all regular commands & chat blocked)
+      !maintenance off          - Deactivates maintenance mode
+      !maintenance status       - Shows current status
+    """
+    if not is_bot_developer_or_owner(ctx.author.id, ctx.author):
+        embed = discord.Embed(
+            title=f"{E_CROSS} Developer Access Required",
+            description="❌ Only Bot Owners / Developers (Bunny / Suyash) can manage global Maintenance Mode!",
+            color=discord.Color.red()
+        )
+        return await ctx.reply(embed=embed, mention_author=False)
+
+    prefix = get_prefix_for_guild(ctx.guild.id if ctx.guild else None)
+    speaker_disp = get_user_display_greeting_name(ctx.author)
+    author_name = getattr(ctx.author, "display_name", "") or getattr(ctx.author, "name", "Developer")
+
+    # If no action provided or action is 'help' / 'info'
+    if not action or action.lower() in ["help", "info"]:
+        info = get_global_maintenance_info()
+        is_on = info.get("enabled", False)
+        status_badge = "🔴 **ACTIVE (ON)**" if is_on else "🟢 **INACTIVE (OFF)**"
+        color = 0xF59E0B if is_on else discord.Color.green()
+
+        embed = discord.Embed(
+            title=f"{E_GEAR} Nayumi Global Maintenance System",
+            description=(
+                f"**Current Status:** {status_badge}\n\n"
+                f"> 🛠️ **Reason:** {info.get('reason', 'N/A')}\n"
+                f"> 👤 **Set By:** `{info.get('enabled_by_name', 'None')}`\n"
+                f"> ⏰ **Enabled At:** `{info.get('enabled_at') or 'N/A'}`\n\n"
+                f"**Commands:**\n"
+                f"• `{prefix}maintenance on [reason]` — Turn maintenance mode ON\n"
+                f"• `{prefix}maintenance off` — Turn maintenance mode OFF\n"
+                f"• `{prefix}maintenance status` — Check current status\n\n"
+                f"*(Note: Bot Owners & Developers can always bypass maintenance mode)*"
+            ),
+            color=color
+        )
+        embed.set_footer(text=f"Requested by {speaker_disp} • Nayumi Operations")
+        return await ctx.reply(embed=embed, mention_author=False)
+
+    act = action.strip().lower()
+    if act in ["on", "enable", "activate", "chalu"]:
+        clean_reason = (reason or "").strip() or "Scheduled system maintenance & upgrades."
+        res = set_global_maintenance(True, reason=clean_reason, user_id=ctx.author.id, user_name=author_name)
+        embed = discord.Embed(
+            title="🛠️ Maintenance Mode Activated",
+            description=(
+                f"**Nayumi is now in Maintenance Mode!** 🔒\n\n"
+                f"> **Reason:** {res.get('reason')}\n"
+                f"> **Activated By:** {ctx.author.mention} (`{author_name}`)\n\n"
+                f"⚠️ **All regular user commands and AI chats are now completely BLOCKED.**\n"
+                f"👑 Only authorized Bot Owners & Developers can run commands and chat with Nayumi.\n\n"
+                f"Use `{prefix}maintenance off` when you are ready to resume operations."
+            ),
+            color=0xF59E0B
+        )
+        embed.set_footer(text="Nayumi Core • System Operations")
+        await ctx.reply(embed=embed, mention_author=False)
+
+    elif act in ["off", "disable", "deactivate", "band", "khatam"]:
+        res = set_global_maintenance(False, user_id=ctx.author.id, user_name=author_name)
+        embed = discord.Embed(
+            title="✅ Maintenance Mode Deactivated",
+            description=(
+                f"**Nayumi is now back ONLINE for all users!** ⚡🎉\n\n"
+                f"> **Deactivated By:** {ctx.author.mention} (`{author_name}`)\n\n"
+                f"All commands, AI chat features, music, and service integrations are fully operational."
+            ),
+            color=discord.Color.green()
+        )
+        embed.set_footer(text="Nayumi Core • System Operations")
+        await ctx.reply(embed=embed, mention_author=False)
+
+    elif act in ["status", "check"]:
+        info = get_global_maintenance_info()
+        is_on = info.get("enabled", False)
+        status_badge = "🔴 **ACTIVE (ON)**" if is_on else "🟢 **INACTIVE (OFF)**"
+        color = 0xF59E0B if is_on else discord.Color.green()
+
+        embed = discord.Embed(
+            title=f"{E_GEAR} Nayumi Maintenance Status",
+            description=(
+                f"**Current Mode:** {status_badge}\n\n"
+                f"> 🛠️ **Reason:** {info.get('reason', 'N/A')}\n"
+                f"> 👤 **Set By:** `{info.get('enabled_by_name', 'None')}`\n"
+                f"> ⏰ **Enabled At:** `{info.get('enabled_at') or 'N/A'}`"
+            ),
+            color=color
+        )
+        embed.set_footer(text="Nayumi Core • System Operations")
+        await ctx.reply(embed=embed, mention_author=False)
+
+    else:
+        await ctx.reply(f"❌ Invalid action `{action}`! Use `{prefix}maintenance on [reason]`, `{prefix}maintenance off`, or `{prefix}maintenance status`.", mention_author=False)
+
+
 # -------------------- TIMER SYSTEM (BUNNY'S ORDER) --------------------
 
 def parse_duration_from_text(full_text: str) -> tuple[int, str]:
@@ -12398,6 +12645,33 @@ async def on_message(message):
         return
 
     if should_process_as_ai:
+        # Check global maintenance mode first (Owner / Bot Developer bypass)
+        if is_global_maintenance_enabled():
+            if not is_bot_developer_or_owner(message.author.id, message.author):
+                maint_info = get_global_maintenance_info()
+                reason = maint_info.get("reason", "Nayumi is currently undergoing scheduled system maintenance & upgrades.")
+                author_name = maint_info.get("enabled_by_name", "Developer")
+                embed = discord.Embed(
+                    title=f"{E_GEAR} Nayumi Under Maintenance",
+                    description=(
+                        f"**Nayumi is currently in Maintenance Mode!** ⚠️\n\n"
+                        f"> 🛠️ **Reason:** {reason}\n"
+                        f"> 👤 **Initiated By:** `{author_name}`\n"
+                        f"> ⏳ All commands and chat features are temporarily paused for maintenance, upgrades, and system improvements.\n\n"
+                        f"Please check back shortly! Thank you for your patience 💖"
+                    ),
+                    color=0xF59E0B
+                )
+                if bot.user and bot.user.display_avatar:
+                    embed.set_footer(text="Nayumi Core • System Operations", icon_url=bot.user.display_avatar.url)
+                else:
+                    embed.set_footer(text="Nayumi Core • System Operations")
+                try:
+                    await message.reply(embed=embed, mention_author=False)
+                except Exception:
+                    pass
+                return
+
         # --- AI Daily Limit Check (Owner & Admins & Whitelisted Users exempt) ---
         if message.guild and not is_admin_or_owner_speaking and not is_whitelisted_ai_user:
             reached, usage, limit = is_ai_limit_reached(message.guild.id)
@@ -13326,6 +13600,8 @@ async def on_ready():
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.CheckFailure):
         return
     if isinstance(error, commands.CommandOnCooldown):
         await send_command_embed(ctx, f"{E_GEAR} Cooldown Active", f"Please try again in `{round(error.retry_after)}s`.", discord.Color.orange())
