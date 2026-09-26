@@ -372,6 +372,32 @@ def set_global_maintenance(enabled: bool, reason: str = "", user_id: int = 0, us
         print(f"[MAINTENANCE] Error writing {GLOBAL_MAINTENANCE_FILE}: {e}", flush=True)
     return current
 
+def create_maintenance_card(reason: str = None) -> discord.Embed:
+    """
+    Renders the exact clean maintenance card matching the user's reference screenshot:
+    - Title: '🔧 Maintenance Mode'
+    - Description:
+      'The bot is currently under maintenance. Please try again later.\n\n*Only owners can use `/maintenance` and `/announce` during this time.*'
+    - No color bar, no footer.
+    """
+    desc = "The bot is currently under maintenance. Please try again later."
+    clean_r = (reason or "").strip()
+    if clean_r and clean_r not in [
+        "Scheduled system maintenance & upgrades.",
+        "Nayumi is currently undergoing scheduled system maintenance & upgrades."
+    ]:
+        desc = f"The bot is currently under maintenance ({clean_r}). Please try again later."
+
+    card = discord.Embed(
+        title="🔧 Maintenance Mode",
+        description=(
+            f"{desc}\n\n"
+            f"*Only owners can use `/maintenance` and `/announce` during this time.*"
+        )
+    )
+    card.remove_footer()
+    return card
+
 def get_user_display_greeting_name(user: Any) -> str:
     """
     Returns a clean, friendly recognized name for the user.
@@ -3458,30 +3484,12 @@ async def global_maintenance_check(ctx):
     if is_bot_developer_or_owner(ctx.author.id, ctx.author):
         return True
 
-    reason = maint_info.get("reason", "Nayumi is currently undergoing scheduled system maintenance & upgrades.")
-    author_name = maint_info.get("enabled_by_name", "Developer")
-
-    embed = discord.Embed(
-        title=f"{E_GEAR} Nayumi Under Maintenance",
-        description=(
-            f"**Nayumi is currently in Maintenance Mode!** ⚠️\n\n"
-            f"> 🛠️ **Reason:** {reason}\n"
-            f"> 👤 **Initiated By:** `{author_name}`\n"
-            f"> ⏳ All commands and chat features are temporarily paused for maintenance, upgrades, and system improvements.\n\n"
-            f"Please check back shortly! Thank you for your patience 💖"
-        ),
-        color=0xF59E0B
-    )
-    if bot.user and bot.user.display_avatar:
-        embed.set_footer(text="Nayumi Core • System Operations", icon_url=bot.user.display_avatar.url)
-    else:
-        embed.set_footer(text="Nayumi Core • System Operations")
-
+    card = create_maintenance_card(maint_info.get("reason"))
     try:
-        await ctx.reply(embed=embed, mention_author=False)
+        await ctx.reply(embed=card, mention_author=False)
     except Exception:
         try:
-            await ctx.send(embed=embed)
+            await ctx.send(embed=card)
         except Exception:
             pass
 
@@ -3489,28 +3497,22 @@ async def global_maintenance_check(ctx):
 
 @bot.tree.interaction_check
 async def global_interaction_maintenance_check(interaction: discord.Interaction) -> bool:
+    # Allow maintenance and announce commands through check (owners handle execution)
+    if interaction.command and interaction.command.name.lower() in ["maintenance", "maint", "announce"]:
+        return True
+
     maint_info = get_global_maintenance_info()
     if not maint_info.get("enabled", False):
         return True
     if is_bot_developer_or_owner(interaction.user.id, interaction.user):
         return True
 
-    reason = maint_info.get("reason", "Nayumi is currently undergoing scheduled system maintenance & upgrades.")
-    embed = discord.Embed(
-        title=f"{E_GEAR} Nayumi Under Maintenance",
-        description=(
-            f"**Nayumi is currently in Maintenance Mode!** ⚠️\n\n"
-            f"> 🛠️ **Reason:** {reason}\n"
-            f"> ⏳ All commands and chat features are temporarily paused for routine maintenance."
-        ),
-        color=0xF59E0B
-    )
-    embed.set_footer(text="Nayumi Core • System Operations")
+    card = create_maintenance_card(maint_info.get("reason"))
     try:
         if not interaction.response.is_done():
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=card, ephemeral=True)
         else:
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=card, ephemeral=True)
     except Exception:
         pass
     return False
@@ -10696,26 +10698,21 @@ async def maintenance_cmd(ctx, action: str = None, *, reason: str = None):
       !maintenance status       - Shows current status
     """
     if not is_bot_developer_or_owner(ctx.author.id, ctx.author):
-        embed = discord.Embed(
-            title=f"{E_CROSS} Developer Access Required",
-            description="❌ Only Bot Owners / Developers (Bunny / Suyash) can manage global Maintenance Mode!",
-            color=discord.Color.red()
-        )
-        return await ctx.reply(embed=embed, mention_author=False)
+        card = create_maintenance_card()
+        return await ctx.reply(embed=card, mention_author=False)
 
     prefix = get_prefix_for_guild(ctx.guild.id if ctx.guild else None)
     speaker_disp = get_user_display_greeting_name(ctx.author)
     author_name = getattr(ctx.author, "display_name", "") or getattr(ctx.author, "name", "Developer")
 
-    # If no action provided or action is 'help' / 'info'
-    if not action or action.lower() in ["help", "info"]:
+    # If no action provided or action is 'help' / 'info' / 'status'
+    if not action or action.lower() in ["help", "info", "status", "check"]:
         info = get_global_maintenance_info()
         is_on = info.get("enabled", False)
         status_badge = "🔴 **ACTIVE (ON)**" if is_on else "🟢 **INACTIVE (OFF)**"
-        color = 0xF59E0B if is_on else discord.Color.green()
 
-        embed = discord.Embed(
-            title=f"{E_GEAR} Nayumi Global Maintenance System",
+        card = discord.Embed(
+            title="🔧 Maintenance Mode",
             description=(
                 f"**Current Status:** {status_badge}\n\n"
                 f"> 🛠️ **Reason:** {info.get('reason', 'N/A')}\n"
@@ -10725,64 +10722,41 @@ async def maintenance_cmd(ctx, action: str = None, *, reason: str = None):
                 f"• `{prefix}maintenance on [reason]` — Turn maintenance mode ON\n"
                 f"• `{prefix}maintenance off` — Turn maintenance mode OFF\n"
                 f"• `{prefix}maintenance status` — Check current status\n\n"
-                f"*(Note: Bot Owners & Developers can always bypass maintenance mode)*"
-            ),
-            color=color
+                f"*Only owners can use `/maintenance` and `/announce` during this time.*"
+            )
         )
-        embed.set_footer(text=f"Requested by {speaker_disp} • Nayumi Operations")
-        return await ctx.reply(embed=embed, mention_author=False)
+        card.remove_footer()
+        return await ctx.reply(embed=card, mention_author=False)
 
     act = action.strip().lower()
     if act in ["on", "enable", "activate", "chalu"]:
         clean_reason = (reason or "").strip() or "Scheduled system maintenance & upgrades."
         res = set_global_maintenance(True, reason=clean_reason, user_id=ctx.author.id, user_name=author_name)
-        embed = discord.Embed(
-            title="🛠️ Maintenance Mode Activated",
+        card = discord.Embed(
+            title="🔧 Maintenance Mode Activated",
             description=(
                 f"**Nayumi is now in Maintenance Mode!** 🔒\n\n"
                 f"> **Reason:** {res.get('reason')}\n"
                 f"> **Activated By:** {ctx.author.mention} (`{author_name}`)\n\n"
-                f"⚠️ **All regular user commands and AI chats are now completely BLOCKED.**\n"
-                f"👑 Only authorized Bot Owners & Developers can run commands and chat with Nayumi.\n\n"
-                f"Use `{prefix}maintenance off` when you are ready to resume operations."
-            ),
-            color=0xF59E0B
+                f"The bot is currently under maintenance. Regular user commands are paused.\n\n"
+                f"*Only owners can use `/maintenance` and `/announce` during this time.*"
+            )
         )
-        embed.set_footer(text="Nayumi Core • System Operations")
-        await ctx.reply(embed=embed, mention_author=False)
+        card.remove_footer()
+        await ctx.reply(embed=card, mention_author=False)
 
     elif act in ["off", "disable", "deactivate", "band", "khatam"]:
         res = set_global_maintenance(False, user_id=ctx.author.id, user_name=author_name)
-        embed = discord.Embed(
-            title="✅ Maintenance Mode Deactivated",
+        card = discord.Embed(
+            title="🔧 Maintenance Mode Deactivated",
             description=(
                 f"**Nayumi is now back ONLINE for all users!** ⚡🎉\n\n"
                 f"> **Deactivated By:** {ctx.author.mention} (`{author_name}`)\n\n"
-                f"All commands, AI chat features, music, and service integrations are fully operational."
-            ),
-            color=discord.Color.green()
+                f"All commands, AI chat features, and services are fully operational."
+            )
         )
-        embed.set_footer(text="Nayumi Core • System Operations")
-        await ctx.reply(embed=embed, mention_author=False)
-
-    elif act in ["status", "check"]:
-        info = get_global_maintenance_info()
-        is_on = info.get("enabled", False)
-        status_badge = "🔴 **ACTIVE (ON)**" if is_on else "🟢 **INACTIVE (OFF)**"
-        color = 0xF59E0B if is_on else discord.Color.green()
-
-        embed = discord.Embed(
-            title=f"{E_GEAR} Nayumi Maintenance Status",
-            description=(
-                f"**Current Mode:** {status_badge}\n\n"
-                f"> 🛠️ **Reason:** {info.get('reason', 'N/A')}\n"
-                f"> 👤 **Set By:** `{info.get('enabled_by_name', 'None')}`\n"
-                f"> ⏰ **Enabled At:** `{info.get('enabled_at') or 'N/A'}`"
-            ),
-            color=color
-        )
-        embed.set_footer(text="Nayumi Core • System Operations")
-        await ctx.reply(embed=embed, mention_author=False)
+        card.remove_footer()
+        await ctx.reply(embed=card, mention_author=False)
 
     else:
         await ctx.reply(f"❌ Invalid action `{action}`! Use `{prefix}maintenance on [reason]`, `{prefix}maintenance off`, or `{prefix}maintenance status`.", mention_author=False)
@@ -12334,6 +12308,76 @@ async def slash_announce(
     except Exception as e:
         await interaction.followup.send(f"⚠️ Failed to send announcement: `{str(e)}`", ephemeral=True)
 
+
+@bot.tree.command(name="maintenance", description="Control global maintenance mode (Bot Owners & Developers only).")
+@app_commands.describe(
+    action="Choose: 'on', 'off', or 'status'",
+    reason="Optional maintenance reason to display"
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="on (Activate Maintenance)", value="on"),
+    app_commands.Choice(name="off (Deactivate Maintenance)", value="off"),
+    app_commands.Choice(name="status (Check Current Status)", value="status")
+])
+async def slash_maintenance(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    reason: str = None
+):
+    if not is_bot_developer_or_owner(interaction.user.id, interaction.user):
+        card = create_maintenance_card()
+        return await interaction.response.send_message(embed=card, ephemeral=True)
+
+    author_name = getattr(interaction.user, "display_name", "") or getattr(interaction.user, "name", "Developer")
+    act = action.value.strip().lower()
+
+    if act == "on":
+        clean_reason = (reason or "").strip() or "Scheduled system maintenance & upgrades."
+        res = set_global_maintenance(True, reason=clean_reason, user_id=interaction.user.id, user_name=author_name)
+        card = discord.Embed(
+            title="🔧 Maintenance Mode Activated",
+            description=(
+                f"**Nayumi is now in Maintenance Mode!** 🔒\n\n"
+                f"> **Reason:** {res.get('reason')}\n"
+                f"> **Activated By:** {interaction.user.mention} (`{author_name}`)\n\n"
+                f"The bot is currently under maintenance. Regular user commands are paused.\n\n"
+                f"*Only owners can use `/maintenance` and `/announce` during this time.*"
+            )
+        )
+        card.remove_footer()
+        await interaction.response.send_message(embed=card, ephemeral=True)
+
+    elif act == "off":
+        res = set_global_maintenance(False, user_id=interaction.user.id, user_name=author_name)
+        card = discord.Embed(
+            title="🔧 Maintenance Mode Deactivated",
+            description=(
+                f"**Nayumi is now back ONLINE for all users!** ⚡🎉\n\n"
+                f"> **Deactivated By:** {interaction.user.mention} (`{author_name}`)\n\n"
+                f"All commands, AI chat features, and services are fully operational."
+            )
+        )
+        card.remove_footer()
+        await interaction.response.send_message(embed=card, ephemeral=True)
+
+    else:
+        info = get_global_maintenance_info()
+        is_on = info.get("enabled", False)
+        status_badge = "🔴 **ACTIVE (ON)**" if is_on else "🟢 **INACTIVE (OFF)**"
+        card = discord.Embed(
+            title="🔧 Maintenance Mode Status",
+            description=(
+                f"**Current Status:** {status_badge}\n\n"
+                f"> 🛠️ **Reason:** {info.get('reason', 'N/A')}\n"
+                f"> 👤 **Set By:** `{info.get('enabled_by_name', 'None')}`\n"
+                f"> ⏰ **Enabled At:** `{info.get('enabled_at') or 'N/A'}`\n\n"
+                f"*Only owners can use `/maintenance` and `/announce` during this time.*"
+            )
+        )
+        card.remove_footer()
+        await interaction.response.send_message(embed=card, ephemeral=True)
+
+
 @bot.event
 async def on_message(message):
     if message.author.bot:
@@ -12649,25 +12693,9 @@ async def on_message(message):
         if is_global_maintenance_enabled():
             if not is_bot_developer_or_owner(message.author.id, message.author):
                 maint_info = get_global_maintenance_info()
-                reason = maint_info.get("reason", "Nayumi is currently undergoing scheduled system maintenance & upgrades.")
-                author_name = maint_info.get("enabled_by_name", "Developer")
-                embed = discord.Embed(
-                    title=f"{E_GEAR} Nayumi Under Maintenance",
-                    description=(
-                        f"**Nayumi is currently in Maintenance Mode!** ⚠️\n\n"
-                        f"> 🛠️ **Reason:** {reason}\n"
-                        f"> 👤 **Initiated By:** `{author_name}`\n"
-                        f"> ⏳ All commands and chat features are temporarily paused for maintenance, upgrades, and system improvements.\n\n"
-                        f"Please check back shortly! Thank you for your patience 💖"
-                    ),
-                    color=0xF59E0B
-                )
-                if bot.user and bot.user.display_avatar:
-                    embed.set_footer(text="Nayumi Core • System Operations", icon_url=bot.user.display_avatar.url)
-                else:
-                    embed.set_footer(text="Nayumi Core • System Operations")
+                card = create_maintenance_card(maint_info.get("reason"))
                 try:
-                    await message.reply(embed=embed, mention_author=False)
+                    await message.reply(embed=card, mention_author=False)
                 except Exception:
                     pass
                 return
