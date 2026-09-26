@@ -8,6 +8,7 @@ import sys
 import json
 import asyncio
 import traceback
+from chat_quality import clean_chat_reply
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Tuple, Optional, List
 
@@ -1200,7 +1201,12 @@ class AgentEngine:
         """
         Parses action tags from AI response, executes tools, and returns clean human text.
         """
-        clean_text = raw_response
+        # Code samples may demonstrate ACTION tags or tool-call JSON; never execute them.
+        code_blocks = []
+        def preserve_code(match):
+            code_blocks.append(match.group(0))
+            return f"NAYUMI_LITERAL_CODE_{len(code_blocks) - 1}_END"
+        clean_text = re.sub(r'```[\s\S]*?```', preserve_code, raw_response)
         executed_results = []
 
         # Strip any thinking tags or markdown reasoning blocks
@@ -1278,30 +1284,10 @@ class AgentEngine:
         # Strip all [ACTION: ...] tags including any surrounding markdown stars or extra whitespace
         clean_text = re.sub(r'\*?\*?\[\s*ACTION:\s*[a-zA-Z0-9_]+(?:\(.*?\))?\s*\]\*?\*?', '', clean_text, flags=re.DOTALL)
         clean_text = re.sub(r'\[(?:Nayumi\'s Reply to|Reply to|Nayumi to)[^\]]+\]:\s*', '', clean_text, flags=re.IGNORECASE)
-        clean_text = re.sub(r'^\s*(?:\([^)]+\)|\*[^*]+\*)\s*', '', clean_text)
         # Strip any leaked raw JSON assistant objects
         clean_text = re.sub(r'\{[\s\S]*?"tool_calls"[\s\S]*?\}', '', clean_text)
 
-        # Strip internal analysis / reasoning bullet preambles and metadata leaks
-        clean_text = re.sub(r'^(?:Message:\s*["\'][^"\']+["\']\s*\*?\s*)+', '', clean_text, flags=re.IGNORECASE)
-        clean_text = re.sub(r'\*\s*(?:Relationship|Context|Directive|Language|Persona|Speaker|User|Constraint|Input|Mood):\s*[^*\r\n]+', '', clean_text, flags=re.IGNORECASE)
-        clean_text = re.sub(r'^(?:Message|Relationship|Context|Directive|Language|Persona|Speaker|User|Constraint|Input|Mood):\s*[^\r\n]*(?:\r?\n|$)', '', clean_text, flags=re.IGNORECASE | re.MULTILINE)
-
-        lines = clean_text.splitlines()
-        clean_lines = []
-        in_analysis = True
-        for l in lines:
-            st = l.strip()
-            if in_analysis:
-                if st.startswith(("•", "o ", "-")) or re.match(r'^(?:[A-Z0-9_\s]+\s*\([^)]+\)\.?|"[^"]+"\s*\([^)]+\)\.?|Message:|Analysis:|Intent:|Context:|Persona:|Speaker:|Draft \d+:|Constraint:|Directive:|Relationship:|Language:|Input:)', st, re.IGNORECASE):
-                    continue
-                if not st:
-                    continue
-                in_analysis = False
-            clean_lines.append(l)
-        
-        if clean_lines:
-            clean_text = "\n".join(clean_lines).strip()
+        clean_text = clean_chat_reply(clean_text)
 
         # If any executed tool encountered an error or channel not found, append clear status to prevent hallucination
         for r in executed_results:
@@ -1313,5 +1299,7 @@ class AgentEngine:
                 warn_msg = res_data.get("result")
                 clean_text += f"\n\n⚠️ *{warn_msg}*"
 
+        for index, block in enumerate(code_blocks):
+            clean_text = clean_text.replace(f"NAYUMI_LITERAL_CODE_{index}_END", block)
         return clean_text.strip(), executed_results
 

@@ -718,12 +718,9 @@ def get_ytdl_opts(custom: Optional[Dict[str, Any]] = None, use_cookies: bool = F
         'no_warnings': True,
         'socket_timeout': 8,
         'source_address': '0.0.0.0',
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['mweb', 'android'],
-                'player_skip': ['configs', 'webpage', 'js']
-            }
-        },
+        'retries': 2,
+        'extractor_retries': 2,
+        'js_runtimes': {name: {} for name in ('deno', 'node') if shutil.which(name)},
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
@@ -2414,19 +2411,6 @@ def get_fast_reliable_thumbnail(raw_thumb: str = "", uri: str = "", title: str =
             return f"https://i.ytimg.com/vi/{m.group(1)}/hqdefault.jpg"
 
 
-        # 2. Check for JioSaavn CDN image (use crisp 500x500 and native .jpg for instant proxy caching)
-
-        if "saavncdn.com" in thumb:
-
-            clean_saavn = thumb.split('?')[0].replace('150x150', '500x500')
-
-            if clean_saavn.endswith('.webp'):
-
-                clean_saavn = clean_saavn[:-5] + '.jpg'
-
-            return clean_saavn
-
-
         # 3. If Spotify CDN image (i.scdn.co)
 
         if "i.scdn.co" in thumb:
@@ -2789,51 +2773,6 @@ def create_music_card(
     return buf
 
 
-def decrypt_saavn_media_url(enc_url: str) -> Optional[str]:
-
-    """Decrypts JioSaavn encrypted media URLs to direct 320kbps CD lossless audio stream URLs."""
-
-    if not enc_url:
-
-        return None
-
-    try:
-
-        from Crypto.Cipher import DES
-
-        key = b'38346591'
-
-        cipher = DES.new(key, DES.MODE_ECB)
-
-        enc_bytes = base64.b64decode(enc_url.strip())
-
-        dec = cipher.decrypt(enc_bytes)
-
-        pad = dec[-1]
-
-        if isinstance(pad, int) and 0 < pad < 8:
-
-            dec = dec[:-pad]
-
-        dec_url = dec.decode('utf-8', errors='ignore').strip()
-
-        if dec_url.startswith('http'):
-
-            # Convert _96.mp4 / _160.mp4 to _320.mp4 for lossless 320kbps CD stream
-
-            dec_320 = re.sub(r'_(96|160)\.mp4$', '_320.mp4', dec_url)
-
-            return dec_320
-
-        return None
-
-    except Exception as e:
-
-        print(f"[Saavn DES Decrypt Error] {e}", flush=True)
-
-        return None
-
-
 class BufferedAudioSource(discord.AudioSource):
     """
     Ultra-High-Performance Audio Ring Buffer for Discord Voice.
@@ -3174,6 +3113,9 @@ class GuildPlayer:
         self.explicit_disconnect: bool = False
 
         self.play_id: int = 0
+        self._advance_lock = asyncio.Lock()
+        self._playback_failures = 0
+        self._loading_count = 0
 
         self.played_uris: set = set()
         self.played_titles: set = set()
@@ -3285,7 +3227,18 @@ class GuildPlayer:
         return "-vn"
 
 
+    @property
+    def is_loading(self) -> bool:
+        return self._loading_count > 0
+
     async def play_track(self, track: Track, seek_ms: int = 0):
+        self._loading_count += 1
+        try:
+            return await self._play_track(track, seek_ms)
+        finally:
+            self._loading_count -= 1
+
+    async def _play_track(self, track: Track, seek_ms: int = 0):
 
         if not is_vc_connected(self.voice_client):
 
@@ -3340,6 +3293,7 @@ class GuildPlayer:
                 self.history.pop(0)
 
 
+        self.cancel_autoplay_prefetch()
         self.current = track
 
         if track.uri:
@@ -3371,202 +3325,18 @@ class GuildPlayer:
         current_play_id = self.play_id
 
 
-        # ---------------- HIGH-FIDELITY NATIVE STREAM ENGINE ----------------
-
-        stream_target = None
-
-        if track.direct_url and (time.time() - track.direct_url_time < 3600):
-
-            stream_target = track.direct_url
-
-        elif track.stream_url and track.stream_url.startswith("http") and "googlevideo.com" in track.stream_url:
-
-            stream_target = track.stream_url
-
-            track.direct_url = stream_target
-
-            track.direct_url_time = time.time()
-
-
+        stream_target = await self.cog.resolve_stream(track)
+        if current_play_id != self.play_id:
+            return
         if not stream_target:
-
-            # Tier 1: JioSaavn CDN direct 320kbps lossless resolution (Cloud Hosting & Nexcloud immune)
-
-            if not (track.uri and ("youtube.com" in track.uri or "youtu.be" in track.uri)):
-
-                try:
-
-                    saavn_res = await self.cog.resolve_saavn_track(f"{track.title} {track.author or ''}", track.requester)
-
-                    if saavn_res and saavn_res.direct_url:
-
-                        stream_target = saavn_res.direct_url
-
-                        track.direct_url = stream_target
-
-                        track.direct_url_time = time.time()
-
-                        if not track.thumbnail and saavn_res.thumbnail:
-
-                            track.thumbnail = saavn_res.thumbnail
-
-                except Exception as s_ex:
-
-                    print(f"[play_track] Saavn extract error: {s_ex}", flush=True)
-
-
-            if not stream_target:
-
-                loop = asyncio.get_event_loop()
-
-                def _extract_live_audio():
-
-                    if track.uri and track.uri.startswith("http") and "open.spotify.com" not in track.uri and "spotify" not in track.uri:
-
-                        target_query = track.uri
-
-                    else:
-
-                        target_query = f"ytsearch1:{track.title} {track.author or ''}"
-
-
-                    for use_ck in [False, True]:
-
-                        try:
-
-                            ydl_cfg = get_ytdl_opts({
-
-                                'format': 'bestaudio/best',
-
-                                'noplaylist': True,
-
-                                'quiet': True,
-
-                                'source_address': '0.0.0.0',
-
-                                'socket_timeout': 15,
-
-                            }, use_cookies=use_ck)
-
-                            with yt_dlp.YoutubeDL(ydl_cfg) as ydl:
-
-                                info = ydl.extract_info(target_query, download=False)
-
-                                if info and 'entries' in info and info['entries']:
-
-                                    entry = info['entries'][0]
-
-                                    if not track.thumbnail and entry.get('thumbnail'):
-
-                                        track.thumbnail = entry.get('thumbnail')
-
-                                    if entry.get('url'):
-
-                                        return entry.get('url')
-
-                                elif info and info.get('url'):
-
-                                    if not track.thumbnail and info.get('thumbnail'):
-
-                                        track.thumbnail = info.get('thumbnail')
-
-                                    return info.get('url')
-
-                        except Exception as ex:
-
-                            print(f"[play_track] _extract_live_audio error: {ex}", flush=True)
-
-                    return None
-
-
-                live_url = await loop.run_in_executor(None, _extract_live_audio)
-
-                if live_url and ("googlevideo.com" in live_url or "manifest" in live_url or live_url.startswith("http")):
-
-                    stream_target = live_url
-
-                    track.direct_url = stream_target
-
-                    track.direct_url_time = time.time()
-
-
-            if not stream_target:
-
-                loop = asyncio.get_event_loop()
-
-                def _extract_sc():
-
-                    try:
-
-                        clean_queries = extract_clean_song_queries(track.title, track.author or "")
-
-                        target_sc_q = clean_queries[0] if clean_queries else f"{track.title} {track.author or ''}"
-
-                        sc_opts = get_sc_opts({'format': 'bestaudio/best', 'quiet': True})
-
-                        with yt_dlp.YoutubeDL(sc_opts) as ydl:
-
-                            info = ydl.extract_info(f"scsearch1:{target_sc_q}", download=False)
-
-                            if info and 'entries' in info and info['entries']:
-
-                                return info['entries'][0].get('url')
-
-                            elif info:
-
-                                return info.get('url')
-
-                    except Exception:
-
-                        pass
-
-                    return None
-
-                sc_url = await loop.run_in_executor(None, _extract_sc)
-
-                if sc_url and sc_url.startswith("http"):
-
-                    stream_target = sc_url
-
-                    track.direct_url = stream_target
-
-                    track.direct_url_time = time.time()
-
-
-            # Final Fallback to JioSaavn if YouTube/SoundCloud failed
-
-            if not stream_target:
-
-                try:
-
-                    saavn_res = await self.cog.resolve_saavn_track(f"{track.title} {track.author or ''}", track.requester)
-
-                    if saavn_res and saavn_res.direct_url:
-
-                        stream_target = saavn_res.direct_url
-
-                        track.direct_url = stream_target
-
-                        track.direct_url_time = time.time()
-
-                except Exception:
-
-                    pass
-
-
-            if not stream_target or not stream_target.startswith("http"):
-
-                print(f"[play_track] Could not resolve stream URL for {track.title}")
-
+            self._playback_failures += 1
+            if self._playback_failures >= 3:
+                self.autoplay = False
+            if self.home_channel:
+                await self.home_channel.send("Couldn't load this track's audio. Skipping to the next song.")
+            if current_play_id == self.play_id:
                 self.bot.loop.create_task(self.play_next())
-
-                return
-
-
-            track.direct_url = stream_target
-
-            track.direct_url_time = time.time()
-
+            return
 
         ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
         before_opts = f'-headers "User-Agent: {ua}\r\n" -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin'
@@ -3577,7 +3347,7 @@ class GuildPlayer:
 
         try:
             raw_source = discord.FFmpegPCMAudio(stream_target, executable=FFMPEG_EXECUTABLE, before_options=before_opts, options=opts)
-            buffered_source = NayumiBufferedAudioSource(raw_source, prebuffer_frames=50, max_buffer_frames=500)
+            buffered_source = await asyncio.to_thread(NayumiBufferedAudioSource, raw_source, prebuffer_frames=50, max_buffer_frames=500)
             vol_source = NayumiVolumeTransformer(buffered_source, volume_pct=self.volume)
             self.volume_transformer = vol_source
             self.current_source = vol_source
@@ -3604,6 +3374,10 @@ class GuildPlayer:
             return
 
 
+        if current_play_id != self.play_id:
+            vol_source.cleanup()
+            return
+
         def after_callback(err):
 
             if current_play_id != self.play_id:
@@ -3614,7 +3388,10 @@ class GuildPlayer:
 
                 print(f"Playback error: {err}", flush=True)
 
-            self.bot.loop.create_task(self.on_track_end())
+            # Discord invokes this callback on its audio worker thread.
+            self.bot.loop.call_soon_threadsafe(
+                lambda: self.bot.loop.create_task(self.on_track_end(current_play_id, err))
+            )
 
 
         # Verify voice client is still connected before play
@@ -3661,9 +3438,6 @@ class GuildPlayer:
                 fec=True,
                 expected_packet_loss=0.05
             )
-        except TypeError:
-            self.voice_client.play(vol_source, after=after_callback)
-
         except Exception as play_ex:
 
             import traceback
@@ -3706,6 +3480,8 @@ class GuildPlayer:
             self.bot.loop.create_task(self.cog.update_voice_channel_status(self.voice_client.channel.id, status_text))
 
 
+        self.start_time = time.time() - (seek_ms / 1000.0)
+
         if self.prefetch_task and not self.prefetch_task.done():
 
             self.prefetch_task.cancel()
@@ -3739,7 +3515,15 @@ class GuildPlayer:
                 print(f"Failed to send Now Playing card: {ex}")
 
 
-    async def on_track_end(self):
+    async def on_track_end(self, expected_play_id=None, error=None):
+        async with self._advance_lock:
+            if expected_play_id is not None and expected_play_id != self.play_id:
+                return
+            # Claim this completion so duplicate callbacks cannot advance twice.
+            self.play_id += 1
+            await self._finish_track(error)
+
+    async def _finish_track(self, error=None):
         # Do not discard/skip queue if voice client unexpectedly disconnected
         if not is_vc_connected(self.voice_client) and not is_vc_connected(self.guild.voice_client):
             return
@@ -3749,75 +3533,92 @@ class GuildPlayer:
             await self.play_next()
             return
 
-        if self.loop_mode == "track" and self.current:
+        # FFmpeg can exit without raising when a CDN rejects an expired URL.
+        if self.current and self.current.length > 10000 and time.time() - self.start_time < 2:
+            error = error or RuntimeError("Audio ended before playback started")
+            self.current.direct_url = None
+        self._playback_failures = self._playback_failures + 1 if error else 0
+        if self._playback_failures >= 3:
+            self.autoplay = False
+
+        if not error and self.loop_mode == "track" and self.current:
             await self.play_track(self.current)
             return
 
-        if self.loop_mode == "queue" and self.current:
+        if not error and self.loop_mode == "queue" and self.current:
             self.queue.append(self.current)
 
         await self.play_next()
 
 
+    def cancel_autoplay_prefetch(self):
+        if self.prefetch_task and not self.prefetch_task.done():
+            self.prefetch_task.cancel()
+        self.prefetch_task = None
+        self.prefetched_autoplay = None
+
+    def stop_playback(self):
+        self.play_id += 1
+        self.autoplay = False
+        self.skip_requested = False
+        self._playback_failures = 0
+        self.cancel_autoplay_prefetch()
+        self.queue.clear()
+        self.current = None
+        self.is_paused = False
+        if self.voice_client:
+            self.voice_client.stop()
+
     async def prefetch_autoplay(self):
+        seed = self.current
         try:
-            await asyncio.sleep(2)
-            if not self.autoplay or not self.current or len(self.queue) > 0:
+            if not self.autoplay or not seed or self.queue:
                 return
-
-            recent_uris = [self.current.uri] + [t.uri for t in self.history[-10:]]
-            requester = getattr(self.current, 'requester', None) or self.bot.user
-            auto_track = await self.cog.find_autoplay_track(self.current, recent_uris, requester, player=self)
-            if auto_track and len(self.queue) == 0:
-                self.prefetched_autoplay = auto_track
-                print(f"[Autoplay] Prefetched next track: '{auto_track.title}' by '{auto_track.author}'", flush=True)
+            recent = [seed.uri] + [t.uri for t in self.history[-20:]]
+            track = await asyncio.wait_for(
+                self.cog.find_autoplay_track(seed, recent, seed.requester or self.bot.user, player=self),
+                timeout=45,
+            )
+            if track and self.autoplay and self.current is seed and not self.queue:
+                self.prefetched_autoplay = track
         except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"[Autoplay] Prefetch error: {e}", flush=True)
-
+            raise
+        except Exception as exc:
+            print(f"[Autoplay] Prefetch failed: {exc}", flush=True)
 
     async def play_next(self):
-        if self.queue:
-            next_track = self.queue.pop(0)
-            await self.play_track(next_track)
-        elif self.autoplay:
-            finished_track = self.current
-            self.current = None
-
-            # If prefetch task is running, wait up to 3.5s for it to finish
-            if not self.prefetched_autoplay and self.prefetch_task and not self.prefetch_task.done():
+        generation = self.play_id
+        if not self.queue and self.autoplay and self.current:
+            if not self.prefetched_autoplay:
+                if not self.prefetch_task or self.prefetch_task.done():
+                    self.prefetch_task = self.bot.loop.create_task(self.prefetch_autoplay())
                 try:
-                    await asyncio.wait_for(asyncio.shield(self.prefetch_task), timeout=3.5)
-                except Exception:
-                    pass
+                    await asyncio.wait_for(asyncio.shield(self.prefetch_task), timeout=45)
+                except asyncio.TimeoutError:
+                    self.cancel_autoplay_prefetch()
+                except asyncio.CancelledError:
+                    if generation != self.play_id or not self.autoplay:
+                        return
+                    raise
+            if generation != self.play_id:
+                return
 
-            if self.prefetched_autoplay:
-                track_to_play = self.prefetched_autoplay
-                self.prefetched_autoplay = None
-                print(f"[Autoplay] Streaming prefetched track: '{track_to_play.title}' by '{track_to_play.author}'", flush=True)
-                await self.play_track(track_to_play)
-            else:
-                ref_track = finished_track or (self.history[-1] if self.history else None)
-                if ref_track:
-                    try:
-                        recent_uris = [ref_track.uri] + [t.uri for t in self.history[-10:]]
-                        requester = getattr(ref_track, 'requester', None) or self.bot.user
-                        auto_track = await self.cog.find_autoplay_track(ref_track, recent_uris, requester, player=self)
-                        if auto_track:
-                            print(f"[Autoplay] Streaming fallback track: '{auto_track.title}' by '{auto_track.author}'", flush=True)
-                            await self.play_track(auto_track)
-                            return
-                    except Exception as e:
-                        print(f"[Autoplay] play_next fallback error: {e}", flush=True)
-                if not is_247(self.guild.id):
-                    self.start_idle_timer()
+        # A manual request arriving during recommendation lookup has priority.
+        if self.queue:
+            track = self.queue.pop(0)
+        elif self.autoplay:
+            track = self.prefetched_autoplay
         else:
-            self.current = None
-            if self.voice_client and getattr(self.voice_client, "channel", None):
-                self.bot.loop.create_task(self.cog.update_voice_channel_status(self.voice_client.channel.id, None))
-            if not is_247(self.guild.id):
-                self.start_idle_timer()
+            track = None
+        self.cancel_autoplay_prefetch()
+        if track:
+            await self.play_track(track)
+            return
+        self.current = None
+        if self.voice_client and getattr(self.voice_client, "channel", None):
+            self.bot.loop.create_task(self.cog.update_voice_channel_status(self.voice_client.channel.id, None))
+        if not is_247(self.guild.id):
+            self.start_idle_timer()
 
 
     def start_idle_timer(self):
@@ -4157,9 +3958,7 @@ class MusicControlView(discord.ui.View):
             return
 
 
-        player.queue.clear()
-
-        player.current = None
+        player.stop_playback()
 
         player.voice_client.stop()
 
@@ -6847,8 +6646,7 @@ class MusicCog(commands.Cog, name="Music"):
             # --- LEAVE ---
             if intent == 'LEAVE':
                 player.explicit_disconnect = True
-                player.queue.clear()
-                player.current = None
+                player.stop_playback()
                 player.cancel_idle_timer()
                 if player.prefetch_task and not player.prefetch_task.done():
                     player.prefetch_task.cancel()
@@ -7444,9 +7242,7 @@ class MusicCog(commands.Cog, name="Music"):
 
         elif custom_id == "m_btn_stop":
 
-            player.queue.clear()
-
-            player.current = None
+            player.stop_playback()
 
             player.voice_client.stop()
 
@@ -7882,242 +7678,6 @@ class MusicCog(commands.Cog, name="Music"):
         return await loop.run_in_executor(None, _resolve)
 
 
-    async def resolve_saavn_track(self, query: str, requester: Optional[discord.User] = None) -> Optional[Track]:
-
-        loop = asyncio.get_event_loop()
-
-        def _fetch():
-
-            try:
-
-                clean_q = clean_for_search(query)
-
-                if not clean_q:
-
-                    clean_q = query.strip()
-
-
-                queries_to_try = [clean_q]
-
-                words = clean_q.split()
-
-                if len(words) > 3:
-
-                    queries_to_try.append(' '.join(words[:3]))
-
-                if '-' in query:
-
-                    first_part = clean_for_search(query.split('-')[0])
-
-                    if first_part and first_part not in queries_to_try:
-
-                        queries_to_try.append(first_part)
-
-
-                results = []
-
-                for q_str in queries_to_try:
-
-                    try:
-
-                        url = 'https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&n=10&p=1&_marker=0&ctx=android&q=' + urllib.parse.quote(q_str)
-
-                        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-
-                        resp = urllib.request.urlopen(req, timeout=5)
-
-                        raw = resp.read().decode('utf-8', errors='ignore')
-
-                        data = json.loads(raw)
-
-                        results = data.get('results', [])
-
-                        if results:
-
-                            break
-
-                    except Exception:
-
-                        pass
-
-
-                if not results:
-
-                    return None
-
-
-                # Find best matching candidate with smart phonetic, language & popularity ranking
-
-                def _norm_phonetic(s: str) -> str:
-
-                    s_clean = re.sub(r'[^a-zA-Z0-9\s]', '', s.lower())
-
-                    return re.sub(r'aa+', 'a', re.sub(r'ee+', 'i', re.sub(r'oo+', 'u', s_clean))).strip()
-
-
-                norm_clean_q = _norm_phonetic(clean_q)
-
-
-                def score_candidate(r):
-
-                    t = html.unescape(r.get('song', '')).lower()
-
-                    a = html.unescape(r.get('primary_artists', '') or r.get('singers', '') or '').lower()
-
-                    if is_unwanted_remake(t, clean_q, a):
-
-                        return -100
-
-                    norm_t = _norm_phonetic(t)
-
-                    norm_a = _norm_phonetic(a)
-
-                    lang = str(r.get('language', '')).lower()
-
-                    try:
-
-                        play_count = int(r.get('play_count', 0) or 0)
-
-                    except Exception:
-
-                        play_count = 0
-
-                    score = 0
-
-                    q_words = [w for w in clean_q.lower().split() if len(w) > 1]
-
-                    norm_q_words = [w for w in norm_clean_q.split() if len(w) > 1]
-
-                    title_matches = [w for w in q_words if w in t] or [w for w in norm_q_words if w in norm_t]
-
-                    artist_matches = [w for w in q_words if w in a] or [w for w in norm_q_words if w in norm_a]
-
-                    # MANDATORY RELEVANCE FILTER:
-                    # At least the song title or artist MUST have a solid keyword or phonetic match with the search query!
-                    has_exact = (norm_clean_q == norm_t) or (norm_clean_q in norm_t) or (norm_t in norm_clean_q)
-                    if not has_exact and not title_matches and not (artist_matches and len(artist_matches) >= len(q_words)):
-                        return -100
-
-                    # If multi-word query, ensure at least half of the words match title or artist
-                    if len(q_words) >= 2 and (len(title_matches) + len(artist_matches)) < max(1, len(q_words) // 2):
-                        return -100
-
-                    # Exact / phonetic match bonus
-                    if norm_clean_q == norm_t:
-
-                        score += 45
-
-                    elif norm_clean_q in norm_t or norm_t in norm_clean_q:
-
-                        score += 30
-
-                    elif title_matches:
-
-                        score += len(title_matches) * 10
-
-                    if artist_matches:
-
-                        score += len(artist_matches) * 8
-
-                    # Language Priority
-                    if lang in ['hindi', 'bollywood', 'punjabi', 'english']:
-
-                        score += 5
-
-                    elif lang in ['bhojpuri']:
-
-                        score -= 20  # Demote obscure tracks unless explicitly requested
-
-                    # Popularity boost based on stream count
-                    if play_count > 0:
-
-                        try:
-
-                            score += min(10, math.log10(play_count) * 1.5)
-
-                        except Exception:
-
-                            pass
-
-                    return score
-
-
-                scored = [(score_candidate(r), r) for r in results]
-
-                scored.sort(key=lambda x: x[0], reverse=True)
-
-                if scored and scored[0][0] >= 15:
-
-                    chosen = scored[0][1]
-
-                else:
-
-                    return None
-
-
-                title = html.unescape(chosen.get('song', ''))
-
-                artist = html.unescape(chosen.get('primary_artists', '') or chosen.get('singers', '') or chosen.get('music', '') or 'Unknown Artist')
-
-                duration = int(chosen.get('duration', 0))
-
-                img = chosen.get('image', '').replace('150x150', '500x500')
-
-                if img.endswith('.webp'):
-
-                    img = img[:-5] + '.jpg'
-
-                enc_url = chosen.get('encrypted_media_url', '')
-
-                perma_url = chosen.get('perma_url', '') or ('https://www.jiosaavn.com/song/' + str(chosen.get('id', '')))
-
-
-                if not enc_url:
-
-                    return None
-
-
-                dec_stream_url = decrypt_saavn_media_url(enc_url)
-
-                if not dec_stream_url or not dec_stream_url.startswith('http'):
-
-                    return None
-
-
-                tr = Track(
-
-                    title=title,
-
-                    uri=perma_url,
-
-                    author=artist,
-
-                    duration_sec=duration,
-
-                    stream_url=dec_stream_url,
-
-                    requester=requester,
-
-                    thumbnail=img
-
-                )
-
-                tr.direct_url = dec_stream_url
-
-                tr.direct_url_time = time.time()
-
-                return tr
-
-            except Exception as e:
-
-                print(f"JioSaavn resolve error: {e}", flush=True)
-
-                return None
-
-
-        return await loop.run_in_executor(None, _fetch)
-
-
     async def resolve_lyrics_to_song(self, query: str) -> Optional[str]:
 
         """Uses Gemini AI to identify official song title & artist when user searches or speaks song lyrics."""
@@ -8186,6 +7746,45 @@ class MusicCog(commands.Cog, name="Music"):
         return None
 
 
+    async def resolve_stream(self, track: Track) -> Optional[str]:
+        uri = track.uri or ""
+        if "jiosaavn.com" in uri or "saavncdn.com" in uri:
+            return None
+        if track.direct_url and time.time() - track.direct_url_time < 300:
+            return track.direct_url
+        if not uri.startswith("http") or "spotify" in uri:
+            resolved = await self.search_track(f"{track.title} {track.author}", track.requester)
+            if not resolved:
+                return None
+            uri = resolved.uri
+
+        def extract():
+            attempts = [False, True] if get_ytdl_cookie_file() else [False]
+            for use_cookies in attempts:
+                try:
+                    with yt_dlp.YoutubeDL(get_ytdl_opts({'extract_flat': False}, use_cookies=use_cookies)) as ydl:
+                        info = ydl.extract_info(uri, download=False)
+                        if info and info.get('entries'):
+                            info = next((e for e in info['entries'] if e), None)
+                        if info and info.get('url'):
+                            return info
+                except Exception:
+                    continue
+            return None
+
+        try:
+            info = await asyncio.wait_for(asyncio.to_thread(extract), timeout=35)
+        except asyncio.TimeoutError:
+            return None
+        if not info:
+            return None
+        track.direct_url = info['url']
+        track.direct_url_time = time.time()
+        track.uri = info.get('webpage_url') or uri
+        track.stream_url = track.direct_url
+        track.length = int(info.get('duration') or track.duration_sec) * 1000
+        return track.direct_url
+
     async def search_track(self, query: str, requester: discord.User) -> Optional[Track]:
 
         if "spotify.com" in query or "spotify.link" in query or "spotify.app.link" in query or query.strip().startswith("spotify:"):
@@ -8198,6 +7797,9 @@ class MusicCog(commands.Cog, name="Music"):
 
 
         search_target = query.strip()
+        requested_source = 'sc' if re.match(r'(?i)^scsearch\d*:', search_target) else ('yt' if re.match(r'(?i)^ytsearch\d*:', search_target) else None)
+        if "jiosaavn.com" in search_target.lower() or "saavncdn.com" in search_target.lower():
+            return None
 
         # Clean search prefix artifacts if passed from internal/external search wrappers
         search_target = re.sub(r'(?i)^ytsearch\d*:\s*', '', search_target).strip()
@@ -8212,239 +7814,18 @@ class MusicCog(commands.Cog, name="Music"):
         # ---------------- NATIVE RESOLVER & DIRECT SEARCH ----------------
         loop = asyncio.get_event_loop()
 
-        # Tier 1: JioSaavn Studio 320kbps CD Lossless Master Direct Search (High precision verified match only)
-        if not is_url:
-            try:
-                saavn_tr = await self.resolve_saavn_track(search_target, requester)
-                if saavn_tr and saavn_tr.direct_url:
-                    return saavn_tr
-            except Exception as s_err:
-                print(f"[search_track] JioSaavn direct resolve notice: {s_err}", flush=True)
-
-        # Direct handling for YouTube URLs (including youtu.be, shorts, music.youtube.com)
-        yt_id_match = re.search(r'(?:(?:v=|shorts\/|youtu\.be\/|\/v\/|\/embed\/))([0-9A-Za-z_-]{11})', search_target) if is_url else None
-
-        if yt_id_match:
-
-            yt_vid_id = yt_id_match.group(1)
-
-            canonical_yt_url = f"https://www.youtube.com/watch?v={yt_vid_id}"
-
-
-            # 1. Direct yt-dlp URL extract for exact YouTube audio
-
-            def _extract_yt_stream():
-
-                for use_ck in [False, True]:
-
-                    try:
-
-                        ydl_opts = get_ytdl_opts({
-
-                            'format': 'bestaudio/best',
-
-                            'quiet': True,
-
-                            'no_warnings': True,
-
-                            'noplaylist': True,
-
-                            'source_address': '0.0.0.0',
-
-                            'socket_timeout': 15,
-
-                        }, use_cookies=use_ck)
-
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-
-                            info = ydl.extract_info(canonical_yt_url, download=False)
-
-                            if info and info.get('url'):
-
-                                return info
-
-                    except Exception:
-
-                        pass
-
-                return None
-
-
-            yt_info = await loop.run_in_executor(None, _extract_yt_stream)
-
-            if yt_info:
-
-                yt_title = yt_info.get('title') or 'YouTube Video'
-
-                yt_author = yt_info.get('uploader') or yt_info.get('channel') or 'YouTube'
-
-                yt_duration = int(yt_info.get('duration') or 0)
-
-                yt_stream = yt_info.get('url') or canonical_yt_url
-
-                yt_thumb = yt_info.get('thumbnail') or f"https://i.ytimg.com/vi/{yt_vid_id}/hqdefault.jpg"
-
-
-                tr = Track(
-
-                    title=yt_title,
-
-                    uri=canonical_yt_url,
-
-                    author=yt_author,
-
-                    duration_sec=yt_duration,
-
-                    stream_url=yt_stream,
-
-                    requester=requester,
-
-                    thumbnail=yt_thumb
-
-                )
-
-                if yt_stream and yt_stream.startswith('http') and ('googlevideo.com' in yt_stream or 'manifest' in yt_stream):
-
-                    tr.direct_url = yt_stream
-
-                    tr.direct_url_time = time.time()
-
-                return tr
-
-
-            # 2. oEmbed + SoundCloud fallback if direct stream blocked
-
-            def _fetch_yt_meta():
-
-                try:
-
-                    oembed_url = f"https://www.youtube.com/oembed?url={urllib.parse.quote(canonical_yt_url)}&format=json"
-
-                    req = urllib.request.Request(oembed_url, headers={'User-Agent': 'Mozilla/5.0'})
-
-                    resp = urllib.request.urlopen(req, timeout=3)
-
-                    dat = json.loads(resp.read().decode('utf-8', errors='ignore'))
-
-                    if dat.get('title'):
-
-                        return dat.get('title'), dat.get('author_name'), dat.get('thumbnail_url')
-
-                except Exception:
-
-                    pass
-
-                return None, None, f"https://i.ytimg.com/vi/{yt_vid_id}/hqdefault.jpg"
-
-
-            o_title, o_author, o_thumb = await loop.run_in_executor(None, _fetch_yt_meta)
-
-            o_author = o_author or "YouTube"
-
-            o_thumb = o_thumb or f"https://i.ytimg.com/vi/{yt_vid_id}/hqdefault.jpg"
-
-
-            if o_title:
-
-                clean_queries = extract_clean_song_queries(o_title, o_author)
-
-                def _extract_sc_for_yt():
-
-                    try:
-
-                        sc_opts = get_sc_opts({'format': 'bestaudio/best', 'quiet': True})
-
-                        with yt_dlp.YoutubeDL(sc_opts) as ydl:
-
-                            info = ydl.extract_info(f"scsearch1:{clean_queries[0] if clean_queries else o_title}", download=False)
-
-                            if info and 'entries' in info and info['entries']:
-
-                                return info['entries'][0]
-
-                            elif info:
-
-                                return info
-
-                    except Exception:
-
-                        pass
-
-                    return None
-
-
-                sc_res = await loop.run_in_executor(None, _extract_sc_for_yt)
-                if sc_res and sc_res.get('url'):
-                    sc_tr = Track(
-                        title=o_title,
-                        uri=canonical_yt_url,
-                        author=o_author,
-                        duration_sec=int(sc_res.get('duration') or 210),
-                        stream_url=sc_res.get('url'),
-                        requester=requester,
-                        thumbnail=o_thumb
-                    )
-                    sc_tr.direct_url = sc_res.get('url')
-                    sc_tr.direct_url_time = time.time()
-                    return sc_tr
-
-                # 3. JioSaavn Fallback for YouTube Video metadata
-                try:
-                    saavn_tr = await self.resolve_saavn_track(clean_queries[0] if clean_queries else o_title, requester)
-                    if saavn_tr:
-                        saavn_tr.uri = canonical_yt_url
-                        saavn_tr.title = o_title
-                        saavn_tr.author = o_author
-                        saavn_tr.thumbnail = o_thumb
-                        return saavn_tr
-                except Exception as s_err:
-                    print(f"[search_track] JioSaavn fallback for YT URL error: {s_err}", flush=True)
-
-                # 4. YouTube Search fallback for clean title
-                def _extract_yt_search_fallback():
-                    search_q = clean_queries[0] if clean_queries else o_title
-                    for use_ck in [False, True]:
-                        try:
-                            s_opts = get_ytdl_opts({
-                                'format': 'bestaudio/best',
-                                'quiet': True,
-                                'extract_flat': False,
-                                'noplaylist': True,
-                                'socket_timeout': 15,
-                            }, use_cookies=use_ck)
-                            with yt_dlp.YoutubeDL(s_opts) as ydl:
-                                s_info = ydl.extract_info(f"ytsearch1:{search_q}", download=False)
-                                if s_info and 'entries' in s_info and s_info['entries']:
-                                    return s_info['entries'][0]
-                                elif s_info:
-                                    return s_info
-                        except Exception:
-                            pass
-                    return None
-
-                yt_s_res = await loop.run_in_executor(None, _extract_yt_search_fallback)
-                if yt_s_res:
-                    s_title = yt_s_res.get('title') or o_title
-                    s_author = yt_s_res.get('uploader') or yt_s_res.get('channel') or o_author
-                    s_duration = int(yt_s_res.get('duration') or 0)
-                    s_stream = yt_s_res.get('url') or canonical_yt_url
-                    s_thumb = yt_s_res.get('thumbnail') or o_thumb
-                    s_tr = Track(
-                        title=s_title,
-                        uri=canonical_yt_url,
-                        author=s_author,
-                        duration_sec=s_duration,
-                        stream_url=s_stream,
-                        requester=requester,
-                        thumbnail=s_thumb
-                    )
-                    if s_stream and s_stream.startswith('http') and ('googlevideo.com' in s_stream or 'manifest' in s_stream):
-                        s_tr.direct_url = s_stream
-                        s_tr.direct_url_time = time.time()
-                    return s_tr
-
-
         def _extract():
+
+            if requested_source == 'sc' and not is_url:
+                try:
+                    with yt_dlp.YoutubeDL(get_sc_opts({'extract_flat': True})) as ydl:
+                        info = ydl.extract_info(f'scsearch5:{search_target}', download=False)
+                        for entry in (info or {}).get('entries', []):
+                            if entry and not is_unwanted_remake(entry.get('title', ''), search_target, entry.get('uploader', '')):
+                                return entry
+                except Exception:
+                    pass
+                return None
 
             if is_url:
 
@@ -8524,13 +7905,15 @@ class MusicCog(commands.Cog, name="Music"):
                             if valid_entries:
                                 valid_entries.sort(key=lambda x: x[0], reverse=True)
                                 return valid_entries[0][1]
-                            return info['entries'][0]
+                            return None
                         elif info:
                             return info
                 except Exception as e:
                     print(f"yt-dlp extract search error: {e}", flush=True)
 
             # Fast SoundCloud Search Fallback
+            if requested_source == 'yt':
+                return None
             try:
                 sc_opts = get_sc_opts({'extract_flat': True})
                 with yt_dlp.YoutubeDL(sc_opts) as ydl:
@@ -8539,7 +7922,7 @@ class MusicCog(commands.Cog, name="Music"):
                         for e in info['entries']:
                             if e and not is_unwanted_remake(e.get('title', ''), search_target, e.get('uploader', '')):
                                 return e
-                        return info['entries'][0]
+                        return None
                     elif info:
                         return info
             except Exception as ex:
@@ -8552,28 +7935,11 @@ class MusicCog(commands.Cog, name="Music"):
 
         try:
 
-            entry = await loop.run_in_executor(None, _extract)
+            entry = await asyncio.wait_for(loop.run_in_executor(None, _extract), timeout=30)
 
         except Exception as e:
 
             print(f"[search_track] YouTube extract error: {e}", flush=True)
-
-
-        # Fallback to JioSaavn if YouTube/SoundCloud search returned nothing
-
-        if not entry and not is_url:
-
-            try:
-
-                saavn_tr = await self.resolve_saavn_track(search_target, requester)
-
-                if saavn_tr:
-
-                    return saavn_tr
-
-            except Exception as s_err:
-
-                print(f"[search_track] JioSaavn fallback resolve error: {s_err}", flush=True)
 
 
         if entry:
@@ -8582,7 +7948,9 @@ class MusicCog(commands.Cog, name="Music"):
 
             vid_id = entry.get('id')
 
-            uri = entry.get('webpage_url') or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else query)
+            uri = entry.get('webpage_url') or entry.get('url') or query
+            if not uri.startswith('http') and vid_id:
+                uri = f'https://www.youtube.com/watch?v={vid_id}'
 
             author = entry.get('uploader') or entry.get('channel') or 'Unknown Artist'
 
@@ -8591,7 +7959,7 @@ class MusicCog(commands.Cog, name="Music"):
             direct_stream = entry.get('url') if (entry.get('url') and 'googlevideo.com' in entry.get('url')) else uri
 
 
-            thumb = f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg" if vid_id else (entry.get('thumbnail', '') or '')
+            thumb = entry.get("thumbnail") or (f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg" if vid_id and "youtube.com" in uri else "")
 
             if not thumb:
 
@@ -8665,7 +8033,7 @@ class MusicCog(commands.Cog, name="Music"):
         excluded_titles: List[str] = [raw_title]
         if player:
             excluded_uris.update(player.played_uris)
-            for h in getattr(player, 'history', []):
+            for h in list(getattr(player, 'history', [])) + list(player.queue):
                 if hasattr(h, 'uri') and h.uri:
                     excluded_uris.add(h.uri)
                 if hasattr(h, 'title') and h.title:
@@ -8685,18 +8053,20 @@ class MusicCog(commands.Cog, name="Music"):
             # 2. Secondary: If no similar tracks, get top tracks of similar artists
             if not recommendations and target_artist:
                 similar_artists = await lastfm_client.get_similar_artists(target_artist, limit=4)
-                for sim_art in similar_artists:
-                    art_top = await lastfm_client.get_top_tracks(sim_art, limit=3)
-                    recommendations.extend(art_top)
+                artist_results = await asyncio.gather(
+                    *(lastfm_client.get_top_tracks(artist, limit=3) for artist in similar_artists[:4]),
+                    return_exceptions=True,
+                )
+                for tracks in artist_results:
+                    if isinstance(tracks, list):
+                        recommendations.extend(tracks)
 
             # 3. Tertiary: Top tracks of the artist if still empty
             if not recommendations and target_artist:
                 top_self = await lastfm_client.get_top_tracks(target_artist, limit=5)
                 recommendations.extend(top_self)
 
-            # Shuffle recommendations for natural variety (just like Groove-Music)
-            if recommendations:
-                random.shuffle(recommendations)
+            # Preserve Last.fm's similarity order; recent songs are excluded below.
         except Exception as lfm_err:
             print(f"[Autoplay] Last.fm recommendation error: {lfm_err}", flush=True)
 
@@ -8704,13 +8074,13 @@ class MusicCog(commands.Cog, name="Music"):
         # TIER 2: YOUTUBE MUSIC NATIVE RADIO & MIX (FALLBACK ENGINE)
         # -------------------------------------------------------------
         fallback_queries: List[str] = []
-        vid_id = extract_youtube_video_id(current_track)
+        vid_id = await asyncio.to_thread(extract_youtube_video_id, current_track)
         if vid_id:
             try:
                 ytm_candidates = await loop.run_in_executor(None, fetch_youtube_music_radio_candidates, vid_id)
                 for cand in ytm_candidates:
                     if cand.get('title') and cand.get('author'):
-                        fallback_queries.append(f"{cand['author']} {cand['title']}")
+                        fallback_queries.append(cand.get("url") or f"{cand['author']} {cand['title']}")
             except Exception:
                 pass
 
@@ -8730,13 +8100,15 @@ class MusicCog(commands.Cog, name="Music"):
         def is_valid_candidate(t: Track) -> bool:
             if not t or not t.uri or not t.title:
                 return False
-            if t.uri in excluded_uris:
+            if t.uri in excluded_uris or (player and re.sub(r'[^a-zA-Z0-9]', '', t.title.lower()) in player.played_titles):
                 return False
             dur = getattr(t, 'duration_sec', None) or int((getattr(t, 'length', 0) or 0) // 1000)
             curr_dur = getattr(current_track, 'duration_sec', None) or int((getattr(current_track, 'length', 0) or 0) // 1000)
             if dur > 0 and (dur < 45 or dur > 600) and curr_dur < 600:
                 return False
             t_low = t.title.lower()
+            if is_unwanted_remake(t.title, current_track.title, t.author):
+                return False
             if any(bad in t_low for bad in ["1 hour", "10 hours", "nonstop", "full album", "podcast", "jukebox", "reaction", "shorts", "#shorts", "status"]):
                 return False
             # Deduplication check using clean_title_for_comparison
@@ -8756,21 +8128,15 @@ class MusicCog(commands.Cog, name="Music"):
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for res in results:
                 if isinstance(res, Track) and is_valid_candidate(res):
-                    if player:
-                        player.played_uris.add(res.uri)
-                        player.played_titles.add(res.title)
                     print(f"[Autoplay] Selected track: '{res.title}' by '{res.author}'", flush=True)
                     return res
 
         # Phase B: If recommendations didn't yield a track, try fallback queries
         if fallback_queries:
-            tasks = [self.search_track(q, requester) for q in fallback_queries[:3]]
+            tasks = [self.search_track(q, requester) for q in fallback_queries[:8]]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for res in results:
                 if isinstance(res, Track) and is_valid_candidate(res):
-                    if player:
-                        player.played_uris.add(res.uri)
-                        player.played_titles.add(res.title)
                     print(f"[Autoplay] Selected fallback track: '{res.title}' by '{res.author}'", flush=True)
                     return res
 
@@ -9418,7 +8784,7 @@ class MusicCog(commands.Cog, name="Music"):
         if not track:
             return await status_msg.edit(embed=discord.Embed(description=f"{E_ALERT} No playable results found for `{query}`.", color=ANKUSH_COLOR))
 
-        is_actually_playing = False
+        is_actually_playing = player.is_loading
 
         if player.voice_client:
 
@@ -9902,9 +9268,7 @@ class MusicCog(commands.Cog, name="Music"):
 
         player = self.get_player(ctx.guild)
 
-        player.queue.clear()
-
-        player.current = None
+        player.stop_playback()
 
         if player.voice_client:
 
@@ -10748,8 +10112,7 @@ class MusicCog(commands.Cog, name="Music"):
         """Disconnects the bot from the voice channel."""
         player = self.get_player(ctx.guild)
         player.explicit_disconnect = True
-        player.queue.clear()
-        player.current = None
+        player.stop_playback()
         player.cancel_idle_timer()
 
         if ctx.guild and ctx.guild.voice_client:
@@ -10977,6 +10340,9 @@ class MusicCog(commands.Cog, name="Music"):
                     player.prefetch_task.cancel()
                 player.prefetch_task = self.bot.loop.create_task(player.prefetch_autoplay())
 
+        else:
+            player.cancel_autoplay_prefetch()
+
         if player.last_np_msg:
             self.bot.loop.create_task(self.update_nowplaying_card(player.last_np_msg.channel.id, player.last_np_msg.id, player))
 
@@ -11013,11 +10379,6 @@ class MusicCog(commands.Cog, name="Music"):
         embed.set_footer(text="Developed by Bunny • Nayumi Music")
 
         await ctx.send(embed=embed)
-
-        if player.autoplay and player.is_playing and not player.prefetched_autoplay:
-
-            player.bot.loop.create_task(player.prefetch_autoplay())
-
 
     @commands.command(name="artistradio", aliases=["ar", "radio_station"])
     async def artistradio_cmd(self, ctx: commands.Context, *, artist_name: Optional[str] = None):
