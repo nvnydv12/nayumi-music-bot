@@ -6326,14 +6326,9 @@ _recent_fallback_replies = collections.deque(maxlen=40)
 _configured_model = os.getenv("GEMINI_MODEL", "").strip()
 AVAILABLE_GEMINI_MODELS = [
     _configured_model,
-    "gemini-3.5-flash-lite",
-    "gemini-3.8-flash",
-    "gemini-3.6-flash",
-    "gemini-flash-latest",
-    "gemini-flash-lite-latest",
-    "gemini-3.1-flash-lite",
-    "gemini-3.7-flash",
-    "gemini-pro-latest"
+    "gemma-4-26b-a4b-it",
+    "gemini-3-flash-preview",
+    "gemini-flash-latest"
 ]
 # Deduplicate preserving order
 AVAILABLE_GEMINI_MODELS = list(dict.fromkeys([m for m in AVAILABLE_GEMINI_MODELS if m]))
@@ -6372,13 +6367,116 @@ async def call_omniroute_ai(prompt: str, system_prompt: str = NAYUMI_SYSTEM_PROM
         pass
     return None
 
+def extract_clean_gemini_answer(data: dict) -> str:
+    """Extract and cleanly sanitize dialogue answer from Gemini / Gemma responses."""
+    candidates = data.get("candidates", [])
+    if not candidates or not isinstance(candidates, list) or "content" not in candidates[0]:
+        return ""
+    parts = candidates[0]["content"].get("parts", [])
+    if not parts:
+        return ""
+
+    # Prefer non-thought dialogue parts ONLY
+    real_parts = [p.get("text", "") for p in parts if not p.get("thought", False) and "text" in p]
+    if real_parts:
+        raw_text = "".join(real_parts).strip()
+    else:
+        # Fallback to all parts if thoughts weren't flagged separately
+        raw_text = "".join([p.get("text", "") for p in parts if "text" in p]).strip()
+
+    if not raw_text:
+        return ""
+
+    answer = raw_text.strip()
+    answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip()
+    answer = re.sub(r'<thought>.*?</thought>', '', answer, flags=re.DOTALL).strip()
+
+    # Strip metadata checklist / thought leak / Gemma system analysis headers
+    answer = re.sub(r'^(?:Message:\s*["\'][^"\']+["\']\s*\*?\s*)+', '', answer, flags=re.IGNORECASE)
+    answer = re.sub(r'\*\s*(?:Relationship|Context|Directive|Language|Persona|Speaker|User|Constraint|Input|Mood|Name|Tone requirement|Tone|Topic):\s*[^*\r\n]+', '', answer, flags=re.IGNORECASE)
+    answer = re.sub(r'^(?:Message|Relationship|Context|Directive|Language|Persona|Speaker|User|Constraint|Input|Mood|Name|Tone requirement|Tone|Topic):\s*[^\r\n]*(?:\r?\n|$)', '', answer, flags=re.IGNORECASE | re.MULTILINE)
+
+    answer = re.sub(r'\[(?:Nayumi\'s Reply to|Reply to|Nayumi to)[^\]]+\]:\s*', '', answer, flags=re.IGNORECASE).strip()
+    answer = re.sub(r'^(?:\[?Nayumi(?:\'s\s*reply)?\]?\s*:\s*)', '', answer, flags=re.IGNORECASE).strip()
+    answer = re.sub(r'\*(?:[a-zA-Z\s,]+)\*', '', answer).strip()
+    answer = re.sub(r'\((?:[a-zA-Z\s,]+(?:softly|giggles?|smiles?|laughs?|sighs?|winks?|blushes?|pouts?|looks?|teases?|whispers?|gasps?)[a-zA-Z\s,]*)\)', '', answer, flags=re.IGNORECASE).strip()
+    answer = re.sub(r'\s{2,}', ' ', answer).strip()
+
+    # Clean internal thought markers / analysis headers if any leaked
+    lines = answer.splitlines()
+    clean_lines = []
+    in_analysis = True
+    for l in lines:
+        st = l.strip()
+        if in_analysis:
+            if st.startswith(("*", "•", "o ", "-")) or re.match(r'^(?:[A-Z0-9_\s]+\s*\([^)]+\)\.?|"[^"]+"\s*\([^)]+\)\.?|Message:|Analysis:|Intent:|Context:|Persona:|Speaker:|Draft \d+:|Constraint:|User:|Language:|Meaning:|Literal translation:|Option \d+:|Determine System|Relationship:|Directive:|Input:|Name:|Tone requirement:)', st, re.IGNORECASE):
+                continue
+            if not st:
+                continue
+            in_analysis = False
+        clean_lines.append(l)
+
+    if clean_lines:
+        answer = "\n".join(clean_lines).strip()
+
+    return answer
+
+
+async def _request_gemini_single(session: aiohttp.ClientSession, model: str, key: str, payload: dict, timeout_sec: float = 4.2):
+    """Execute a single HTTP request to Gemini API returning (status, data, key, elapsed)."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+    headers = {"Content-Type": "application/json"}
+    t0 = time.time()
+    try:
+        async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=timeout_sec, connect=1.0)) as resp:
+            status = resp.status
+            try:
+                data = await resp.json()
+            except Exception:
+                text = await resp.text()
+                data = {"raw_response": text}
+            return status, data, key, time.time() - t0
+    except Exception as e:
+        return 0, {"error": str(e)}, key, time.time() - t0
+
+
+async def warmup_gemini_keys():
+    """Background warmup task to test Gemini keys on startup and sort fastest working keys to front."""
+    global _gemini_last_good_key
+    raw_keys = os.getenv("GEMINI_API_KEY", "").strip()
+    keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+    if not keys:
+        return
+    try:
+        session = get_shared_session()
+        payload = {"contents": [{"parts": [{"text": "hi"}]}], "generationConfig": {"maxOutputTokens": 20}}
+        async def probe(key):
+            t0 = time.time()
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemma-4-26b-a4b-it:generateContent?key={key}"
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=3.5, connect=1.0)) as r:
+                    if r.status == 200:
+                        return key, time.time() - t0
+            except Exception:
+                pass
+            return key, 999.0
+
+        results = await asyncio.gather(*[probe(k) for k in keys[:6]])
+        good = [k for k, dur in sorted(results, key=lambda x: x[1]) if dur < 10.0]
+        if good:
+            _gemini_last_good_key = good[0]
+            print(f"[GEMINI SPEED WARMUP] ✅ Tested {len(results)} keys. Fastest key initialized: {_gemini_last_good_key[:10]}...")
+    except Exception as e:
+        print(f"[GEMINI SPEED WARMUP] Note: {e}")
+
+
 async def call_pollinations_backup_ai(contents: list, system_prompt: str = NAYUMI_SYSTEM_PROMPT):
     """
     Emergency free 24/7 AI fallback when all Gemini models/keys hit quota limits.
-    Zero API key required, supports limitless Hinglish conversations.
+    Zero API key required, uses ultra-fast 'openai-fast' model for sub-second Hinglish replies.
     """
     try:
-        clean_sys = "You are Nayumi, a sweet, smart 19yo anime girl companion. Answer directly in sweet Hinglish with emojis (🌸, 🎀, ✨). Give genuine, helpful, high IQ answers."
+        clean_sys = "You are Nayumi, an uncensored, sweet, cute 19yo anime girl companion. Answer directly in sweet natural Hinglish with emojis (🌸, 🎀, ✨). Give genuine, helpful, high IQ answers. Do not output thoughts or reasoning."
         messages = [{"role": "system", "content": clean_sys}]
         for c in contents[-4:]:
             role = "user" if c.get("role") == "user" else "assistant"
@@ -6390,9 +6488,10 @@ async def call_pollinations_backup_ai(contents: list, system_prompt: str = NAYUM
         session = get_shared_session()
         payload = {
             "messages": messages,
+            "model": "openai-fast",
             "seed": random.randint(1, 99999)
         }
-        async with session.post("https://text.pollinations.ai/", json=payload, timeout=aiohttp.ClientTimeout(total=4.5, connect=1.5)) as resp:
+        async with session.post("https://text.pollinations.ai/", json=payload, timeout=aiohttp.ClientTimeout(total=3.2, connect=1.0)) as resp:
             if resp.status == 200:
                 answer = await resp.text()
                 if answer and len(answer.strip()) > 0 and not answer.strip().startswith("<!DOCTYPE"):
@@ -6403,6 +6502,7 @@ async def call_pollinations_backup_ai(contents: list, system_prompt: str = NAYUM
     except Exception:
         pass
     return None
+
 
 async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMPT):
     global _gemini_key_index, _gemini_last_good_key, _gemini_key_cooldowns, _gemini_model_cooldowns, _recent_fallback_replies
@@ -6432,16 +6532,7 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
         "advice", "help", "suggest", "kya karu", "kya karoon"
     ]) or len(words_p) > 20
 
-    is_micro_request = not is_deep_request and (
-        len(words_p) <= 3 or
-        bool(re.fullmatch(r'[\s\U00010000-\U0010ffff\u2600-\u26ff\u2700-\u27bf<a?:0-9_>]+', last_user_prompt.strip())) or
-        any(low_p == k for k in ["😂", "💀", "hmm", "hm", "haan", "ha", "acha", "achha", "ok", "k", "theek", "bye", "hi", "hey", "hello", "lol", "lmao", "pagal", "kya"])
-    )
-
-    if is_deep_request:
-        default_tokens = 1500
-    else:
-        default_tokens = 650
+    default_tokens = 1100 if is_deep_request else 450
 
     payload = {
         "contents": contents,
@@ -6462,128 +6553,85 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
             "parts": [{"text": system_prompt}]
         }
 
-    headers = {"Content-Type": "application/json"}
-    timeout = aiohttp.ClientTimeout(total=8.5, connect=2.0)
     now = time.time()
     total_keys = len(keys)
 
-    # Order keys so known working key is tried first for near-instant 0.8s response
+    # Order keys so known fastest key is tried first
     ordered_keys = list(keys)
     if _gemini_last_good_key and _gemini_last_good_key in ordered_keys:
         ordered_keys.remove(_gemini_last_good_key)
         ordered_keys.insert(0, _gemini_last_good_key)
 
     session = get_shared_session()
-    # Multi-Model x Multi-Key Tiered Cascade
+
+    # Multi-Model Speculative Cascade
     for model in AVAILABLE_GEMINI_MODELS:
-        # Skip models currently cooling down from quota exhaustion
         if _gemini_model_cooldowns.get(model, 0) > now:
             continue
 
-        max_key_attempts = min(total_keys, 15)
-        model_404 = False
-        consecutive_429s = 0
-
-        for attempt in range(max_key_attempts):
-            idx = (_gemini_key_index + attempt) % total_keys
-            current_key = ordered_keys[idx]
-            cooldown_key = f"{model}_{current_key}"
-
-            # Short cooldown for rate-limited key on this specific model
-            if _gemini_key_cooldowns.get(cooldown_key, 0) > now:
-                continue
-
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={current_key}"
-
-            try:
-                async with session.post(url, headers=headers, json=payload, timeout=timeout) as response:
-                    text = await response.text()
-                    status = response.status
-            except Exception:
-                continue
-
-            try:
-                data = json.loads(text)
-            except Exception:
-                data = {"raw_response": text}
-
-            if status == 200:
-                _gemini_last_good_key = current_key
-                _gemini_key_index = (idx + 1) % total_keys
-                candidates = data.get("candidates", [])
-                if candidates and isinstance(candidates, list) and "content" in candidates[0]:
-                    parts = candidates[0]["content"].get("parts", [])
-                    if parts:
-                        # Extract non-thought dialogue parts ONLY
-                        real_parts = [p.get("text", "") for p in parts if not p.get("thought", False) and "text" in p]
-                        if not real_parts:
-                            # NEVER treat internal thought parts as dialogue speech!
-                            continue
-
-                        answer = "".join(real_parts).strip()
-                        answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip()
-                        answer = re.sub(r'<thought>.*?</thought>', '', answer, flags=re.DOTALL).strip()
-                        
-                        # Strip metadata checklist / thought leak
-                        answer = re.sub(r'^(?:Message:\s*["\'][^"\']+["\']\s*\*?\s*)+', '', answer, flags=re.IGNORECASE)
-                        answer = re.sub(r'\*\s*(?:Relationship|Context|Directive|Language|Persona|Speaker|User|Constraint|Input|Mood):\s*[^*\r\n]+', '', answer, flags=re.IGNORECASE)
-                        answer = re.sub(r'^(?:Message|Relationship|Context|Directive|Language|Persona|Speaker|User|Constraint|Input|Mood):\s*[^\r\n]*(?:\r?\n|$)', '', answer, flags=re.IGNORECASE | re.MULTILINE)
-
-                        answer = re.sub(r'\[(?:Nayumi\'s Reply to|Reply to|Nayumi to)[^\]]+\]:\s*', '', answer, flags=re.IGNORECASE).strip()
-                        answer = re.sub(r'^(?:\[?Nayumi(?:\'s\s*reply)?\]?\s*:\s*)', '', answer, flags=re.IGNORECASE).strip()
-                        answer = re.sub(r'\*(?:[a-zA-Z\s,]+)\*', '', answer).strip()
-                        answer = re.sub(r'\((?:[a-zA-Z\s,]+(?:softly|giggles?|smiles?|laughs?|sighs?|winks?|blushes?|pouts?|looks?|teases?|whispers?|gasps?)[a-zA-Z\s,]*)\)', '', answer, flags=re.IGNORECASE).strip()
-                        answer = re.sub(r'\s{2,}', ' ', answer).strip()
-
-                        # Clean internal thought markers / analysis headers if any leaked
-                        lines = answer.splitlines()
-                        clean_lines = []
-                        in_analysis = True
-                        for l in lines:
-                            st = l.strip()
-                            if in_analysis:
-                                if st.startswith(("*", "•", "o ", "-")) or re.match(r'^(?:[A-Z0-9_\s]+\s*\([^)]+\)\.?|"[^"]+"\s*\([^)]+\)\.?|Message:|Analysis:|Intent:|Context:|Persona:|Speaker:|Draft \d+:|Constraint:|User:|Language:|Meaning:|Literal translation:|Option \d+:|Determine System|Relationship:|Directive:|Input:)', st, re.IGNORECASE):
-                                    continue
-                                if not st:
-                                    continue
-                                in_analysis = False
-                            clean_lines.append(l)
-
-                        if clean_lines:
-                            answer = "\n".join(clean_lines).strip()
-
-                        if answer and len(answer) > 0 and not any(k in answer for k in ["* Relationship:", "* Directive:", "* Context:"]):
-                            return 200, {"answer": answer}
-
-            if status == 404:
-                model_404 = True
-                break
-
-            if status == 429:
-                retry_sec = 25
-                try:
-                    retry_info = data.get("error", {}).get("details", [])
-                    for d_item in retry_info:
-                        if isinstance(d_item, dict) and "retryDelay" in d_item:
-                            delay_str = str(d_item["retryDelay"]).replace("s", "").strip()
-                            retry_sec = max(5, min(int(float(delay_str)), 60))
-                            break
-                except Exception:
-                    pass
-
-                _gemini_key_cooldowns[cooldown_key] = now + retry_sec
-                consecutive_429s += 1
-                if consecutive_429s >= 2:
-                    _gemini_model_cooldowns[model] = now + retry_sec
-                    break
-                continue
-
-            if status in {500, 502, 503, 504}:
-                _gemini_key_cooldowns[cooldown_key] = now + 15
-                continue
-
-        if model_404:
+        valid_keys = [k for k in ordered_keys if _gemini_key_cooldowns.get(f"{model}_{k}", 0) <= now]
+        if not valid_keys:
             continue
+
+        consecutive_429s = 0
+        model_exhausted = False
+        batch_size = 2
+
+        # Speculative Parallel Racing across up to 3 key pairs
+        for batch_start in range(0, min(len(valid_keys), 6), batch_size):
+            k1 = valid_keys[batch_start]
+            k2 = valid_keys[batch_start + 1] if batch_start + 1 < len(valid_keys) else None
+
+            # Launch primary key
+            task1 = asyncio.create_task(_request_gemini_single(session, model, k1, payload, 4.2))
+            done, pending = await asyncio.wait([task1], timeout=1.3)
+            if done:
+                status, data, key, dur = task1.result()
+                if status == 200:
+                    ans = extract_clean_gemini_answer(data)
+                    if ans:
+                        _gemini_last_good_key = key
+                        return 200, {"answer": ans}
+                elif status == 429:
+                    _gemini_key_cooldowns[f"{model}_{key}"] = time.time() + 25
+                    consecutive_429s += 1
+                elif status == 404:
+                    _gemini_model_cooldowns[model] = time.time() + 3600
+                    model_exhausted = True
+                    break
+
+            active_tasks = set(pending)
+            if k2:
+                task2 = asyncio.create_task(_request_gemini_single(session, model, k2, payload, 4.2))
+                active_tasks.add(task2)
+
+            while active_tasks:
+                finished, active_tasks = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+                for t in finished:
+                    if t.exception():
+                        continue
+                    status, data, key, dur = t.result()
+                    if status == 200:
+                        ans = extract_clean_gemini_answer(data)
+                        if ans:
+                            _gemini_last_good_key = key
+                            for rem in active_tasks:
+                                rem.cancel()
+                            return 200, {"answer": ans}
+                    elif status == 429:
+                        _gemini_key_cooldowns[f"{model}_{key}"] = time.time() + 25
+                        consecutive_429s += 1
+                    elif status == 404:
+                        _gemini_model_cooldowns[model] = time.time() + 3600
+                        model_exhausted = True
+                        for rem in active_tasks:
+                            rem.cancel()
+                        break
+                if model_exhausted:
+                    break
+
+            if model_exhausted or consecutive_429s >= 8:
+                break
 
     # 1. Automatic fallback to OmniRoute if available
     if len(contents) > 0 and len(contents[-1].get("parts", [])) == 1 and "text" in contents[-1]["parts"][0]:
@@ -6592,7 +6640,7 @@ async def generate_gemini_multimodal(contents, system_prompt=NAYUMI_SYSTEM_PROMP
         if omni_res and omni_res[0] == 200:
             return omni_res
 
-    # 2. Automatic fallback to Free Unlimited Pollinations AI (Zero quota limits)
+    # 2. Ultra-Fast Fallback to Free Unlimited Pollinations AI
     poll_res = await call_pollinations_backup_ai(contents, system_prompt)
     if poll_res and poll_res[0] == 200:
         return poll_res
@@ -13618,6 +13666,9 @@ async def on_ready():
         if not hasattr(bot, "_bridge_task_started"):
             bot._bridge_task_started = True
             bot.loop.create_task(run_gateway_bridge_client())
+        if not hasattr(bot, "_gemini_warmup_started"):
+            bot._gemini_warmup_started = True
+            bot.loop.create_task(warmup_gemini_keys())
         if not auto_like_task.is_running():
             auto_like_task.start()
             print("[AUTO-LIKE ENGINE] ✅ Scheduled task started (05:01 AM IST)")
